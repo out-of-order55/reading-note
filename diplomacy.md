@@ -49,9 +49,6 @@ class AdderNode(dFn: Seq[DownwardParam] => DownwardParam,
   extends NexusNode(AdderNodeImp)(dFn, uFn)
 ```
 
-
-
-
 这个里面有两个模板匹配,然后最终传入的AdderNode的值为(dps和ups的head),最后将输入累加
 
 ```
@@ -152,6 +149,106 @@ class AdderTestHarness()(implicit p: Parameters) extends LazyModule {
 ```
 
 # 2. 根据rocketchip 搭建一个SOC框架(基于ysyxSoC)
+
+首先我们需要包含freechip库,有两种方法,1.直接从云端下载,2.直接导入本地的库,本实验选择第二种,基于ysyxSoC的build.sc来创建自己的sc文件,导入成功后就可以进行自己的SoC搭建
+
+我们的SoC框架如下所示
+
+![1730881092351](image/diplomacy/1730881092351.png)
+
+也就是我们CPU需要一个AXI_master节点,clint,SDRAM和MROM各自需要一个AXI_slave节点,然后AXI_XBAR继承于NexusNode,可支持多个输入节点和多个输出节点
+
+然后设备的地址空间安排如下:
+
+| 设备  | 地址空间                |
+| ----- | ----------------------- |
+| clint | 0x1000_0000-0x1000_ffff |
+| SDRAM | 0x8000_0000-0x9fff_ffff |
+| MROM  | 0x2000_0000-0x2000_ffff |
+
+首先创建clint的slave节点
+
+```
+class AXI4MyCLINT(address: Seq[AddressSet])(implicit p: Parameters) extends LazyModule {
+  val beatBytes = 4
+  val node = AXI4SlaveNode(Seq(AXI4SlavePortParameters(
+    Seq(AXI4SlaveParameters(
+        address       = address,
+        executable    = true,
+        supportsWrite = TransferSizes(1, beatBytes),
+        supportsRead  = TransferSizes(1, beatBytes),
+        interleavedId = Some(0))
+    ),
+    beatBytes  = beatBytes)))
+
+  lazy val module = new Impl
+  class Impl extends LazyModuleImp(this) {
+  }
+}
+```
+
+可以看到我们首先创建了slvae节点，这个节点里面有一个TransferSizes，来揭示最多可以传多少笔数据，这里是按照四笔来说的，然后在之后的LazyModuleImp有具体的实现，我们可以根据传入的node的信号的地址来读写相应的寄存器，然后SDRAM和MROM比较类似，以SDRAM为主要讲解
+
+```
+class AXI4MySDRAM(address: Seq[AddressSet])(implicit p: Parameters) extends LazyModule {
+  val beatBytes = 4
+  val node = AXI4SlaveNode(Seq(AXI4SlavePortParameters(
+    Seq(AXI4SlaveParameters(
+        address       = address,
+        executable    = true,
+        supportsWrite = TransferSizes(1, beatBytes),
+        supportsRead  = TransferSizes(1, beatBytes),
+        interleavedId = Some(0))
+    ),
+    beatBytes  = beatBytes)))
+
+  lazy val module = new Impl
+  class Impl extends LazyModuleImp(this) {
+    val (in, _) = node.in(0)
+    val sdram_bundle = IO(new SDRAMIO)
+
+    val msdram = Module(new sdram_top_axi)
+    msdram.io.clock := clock
+    msdram.io.reset := reset.asBool
+    msdram.io.in <> in
+    sdram_bundle <> msdram.io.sdram
+  }
+}
+```
+
+SDRAM仍然是先创建slave节点，然后LazyModuleImp中将节点连接到msdram的输入端，这个模块是一个黑盒，这地方的好处就是一般sdram和DDR都使用IP,而现在的IP一般都是verilog,所以包裹一层黑盒
+
+```
+class MySoC(implicit p: Parameters) extends LazyModule {
+  val xbar = AXI4Xbar()
+  val cpu = LazyModule(new CPU(idBits = ChipLinkParam.idBits))
+  val lmrom = LazyModule(new AXI4MROM(AddressSet.misaligned(0x20000000, 0x10000)))
+  val lclint = LazyModule(new AXI4MyCLINT(AddressSet.misaligned(0x10000000, 0x10000)))
+  val sdramAddressSet = AddressSet.misaligned(0x80000000L, 0x2000000)
+  val lsdram_axi = Some(LazyModule(new AXI4MySDRAM(sdramAddressSet))) 
+
+  List(lsdram_axi.get.node ,lmrom.node, lclint.node).map(_ := xbar)
+  xbar := cpu.masterNode
+  
+  override lazy val module = new Impl
+  class Impl extends LazyModuleImp(this) with DontTouch {
+
+    cpu.module.reset := SynchronizerShiftReg(reset.asBool, 10) || reset.asBool
+    cpu.module.slave := DontCare
+    val intr_from_chipSlave = IO(Input(Bool()))
+    cpu.module.interrupt := intr_from_chipSlave
+    val sdramBundle = lsdram_axi.get.module.sdram_bundle
+    val sdram = IO(chiselTypeOf(sdramBundle))
+    sdram <> sdramBundle
+  }
+}
+```
+
+首先調用xbar创建XBAR,然后为每个设备分配地址空间,最后连线,也就是将slave node和xbar连线,cpu的master node 和xbar连线,之后就是实现部分,主要也是连线逻辑,然后就结束了整个SOC的创建
+
+![1730880825683](image/diplomacy/1730880825683.png)
+
+最后是生成的代码的一部分,可以看到正确链接
 
 # 3.rocketchip 的AXIDelayer解析
 
