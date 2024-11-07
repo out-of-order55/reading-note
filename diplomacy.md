@@ -331,3 +331,5 @@ class MySoC(implicit p: Parameters) extends LazyModule {
 ```
 
 这一堆主要就是将node in和out的信号和参数分开,然后为w,r,b通道加噪声,最后将这些噪声通过feed传到总线,其实这个模块就是去延迟vaild和ready,在延迟期间bits是noise,在sink为vaild期间就是source的bit
+
+4.
