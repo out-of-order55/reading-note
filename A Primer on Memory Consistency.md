@@ -67,7 +67,6 @@
 > 2. Data-Value Invariant. The value of the memory location at the start of an epoch is the same
 >    as the value of the memory location at the end of its last read–write epoch.
 
-
 > 注意：第二句话的意思就是core1读的数据应该来自core3写的数据的位置，缓存一致性是架构不可见的
 
 # Memory Consistency Motivation and Sequential Consistency
