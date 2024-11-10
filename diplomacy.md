@@ -563,12 +563,10 @@ I/O区域可以指定支持哪些数据宽度的读、写或执行访问组合�
 对于具有基于页面的虚拟内存的系统，I/O和内存区域可以指定支持哪些硬件页表读和硬件页表写的组合。
 
 > 注:类unix操作系统通常要求所有可缓存的主内存都支持PTW。
->
 
 ## 3.6.3. Atomicity PMAs
 
 原子性pma描述在此地址区域中支持哪些原子指令。对原子指令的支持分为两类：LR/SC和AMOs。有些平台可能要求所有可缓存的主存支持附加处理器所需的所有原子操作。
-
 
 在AMOs中，有四个级别的支持：AMONone、amosswap、AMOLogical和AMOArithmetic。
 
@@ -586,7 +584,6 @@ AMONone表示不支持AMO操作。AMOSwap表示该地址范围内只支持AMOSwa
 
 ## 3.6.4. Misaligned Atomicity Granule PMA
 
-
 Misaligned原子性粒子PMA为失调原子性粒子提供了约束支持。这个PMA（如果存在）指定了不对齐原子颗粒的大小，即自然对齐的2次幂字节数。该PMA的特定支持值由MAGNN表示，例如，MAG16表示不对齐的原子性颗粒至少为16字节。
 
 不对齐的原子性颗粒PMA仅适用于基本isa中定义的AMOs、load和store，以及F、D和Q扩展中定义的不超过MXLEN位的load和store。对于该集中的一条指令，如果所有被访问的字节都位于同一个未对齐的原子颗粒中，则该指令不会因为地址对齐而引发异常，并且该指令将仅出于rvwmo的目的而引发一个内存操作。，它将自动执行。
@@ -598,7 +595,6 @@ Misaligned原子性粒子PMA为失调原子性粒子提供了约束支持。这�
 > LR/SC指令不受此PMA的影响，因此当不对齐时总是引发异常。向量内存访问也不受影响，因此即使包含在未对齐的原子性颗粒中，也可能以非原子方式执行。隐式访问类似
 
 ## 3.6.5. Memory-Ordering PMAs
-
 
 为了按照FENCE指令和原子指令排序位进行排序，地址空间的区域被分类为主存或I/O。
 
@@ -626,11 +622,9 @@ coherence主存区域总是具有RVWMO或RVTSO内存模型。
 
 ## 3.6.6. Coherence and Cacheability PMAs
 
-
 内存区域的可缓存性不应该影响该区域的软件视图，除非在其他pma中反映出差异，例如主存与I/O分类、内存排序、支持的访问和原子操作以及一致性。出于这个原因，我们将**可缓存性**视为仅由机器模式软件管理的平台级设置。
 
 如果平台支持内存区域的可配置缓存设置，则特定于平台的机器模式例程将在必要时更改设置并刷新缓存，因此系统仅在可缓存设置之间的转换期间不一致。较低的特权级别不应该看到这个临时状态
-
 
 一致性很容易提供一个共享内存区域，它不被任何代理缓存。这样一个区域的PMA将简单地表示它不应该缓存在私有或共享缓存中。
 
@@ -666,7 +660,6 @@ coherence主存区域总是具有RVWMO或RVTSO内存模型。
 
 # 3.7. Physical Memory Protection
 
-
 为了支持安全处理和包含错误，需要限制运行在硬件上的软件可访问的物理地址。一个可选的物理内存保护（PMP）单元提供每台机器模式控制寄存器，允许为每个物理内存区域指定物理内存访问特权（读、写、执行）。PMP值与第3.6节中描述的PMA检查并行检查。
 
 PMP访问控制设置的粒度是特定于平台的，但是标准PMP编码支持小至4字节的区域。某些区域的特权可以是硬连接的，例如，某些区域可能只在机器模式下可见，而在低特权层中不可见。
@@ -679,7 +672,6 @@ PMP违规总是被捕捉到精确异常
 
 ## 3.7.1. Physical Memory Protection CSRs
 
-
 PMP表项由一个8位配置寄存器和一个mxlen位地址寄存器描述。
 
 一些PMP设置还使用与前一个PMP项相关联的地址寄存器。最多支持64个PMP表项。实现可以实现0、16或64个PMP表项；编号最少的PMP表项必须首先实现。所有PMP CSR字段都是WARL，可以是只读零。PMP csr仅在m模式下可访问。
@@ -689,7 +681,6 @@ PMP配置寄存器被密集地打包到csr中，以最小化上下文切换时�
 PMP地址寄存器是命名为pmpaddr0-pmpaddr63的csr。每个PMP地址寄存器为RV32编码34位物理地址的第33-2位，如图32所示。对于RV64，每个PMP地址寄存器编码56位物理地址的第55-2位，如图33所示。并非所有的物理地址位都可以实现，因此pmpaddr寄存器是WARL
 
 > 注:章节10.3中描述的基于Sv32页面的虚拟内存方案支持RV32的34位物理地址，因此PMP方案必须支持RV32的大于XLEN的地址。第10.4节和10.5节中描述的Sv39和Sv48基于页面的虚拟内存方案支持56位物理地址空间，因此RV64 PMP地址寄存器施加了相同的限制。
->
 
 ![1731164360120](image/diplomacy/1731164360120.png)
 
@@ -707,11 +698,9 @@ PMP表项配置寄存器中的A字段编码了相关联的PMP地址寄存器的�
 
 NAPOT范围使用相关地址寄存器的低阶位来编码范围的大小，如表19所示。检测连续1的数目
 
-
 * 若 `pmpaddr`值为 `yyyy...yy01`，即连续1的个数为1，则该PMP entry所控制的地址空间为从 `yyyy...yy00`开始的16个字节
 
 ![1731164947670](image/diplomacy/1731164947670.png)
-
 
 如果选择TOR，则关联的地址寄存器为地址范围的顶部，前面的PMP地址寄存器为地址范围的底部。如果PMP表项i的A字段设置为TOR，则该表项匹配任何地址y，使pmpaddri-1≤y<pmpaddri（与pmpcfgi-1的值无关）。如果PMP条目0的A字段设置为TOR，则使用0作为下界，因此它匹配任何地址y<pmpaddr0。
 
@@ -752,3 +741,565 @@ PMP表项的优先级是静态的。与访问的任何字节匹配的编号最�
 使用虚拟内存的实现被允许在显式内存访问要求之前推测性地执行地址转换，并被允许将它们缓存在地址转换缓存结构中——包括可能缓存在Bare转换模式和m模式中使用的从有效地址到物理地址的身份映射。结果物理地址的PMP设置可以在地址转换和显式内存访问之间的任何点进行检查（并可能进行缓存）。因此，当修改PMP设置时，m模式软件必须将PMP设置与虚拟内存系统以及任何PMP或地址转换缓存同步。这是通过执行一个SFENCE来完成的。在PMP csr写入后，rs1=x0和rs2=x0的VMA指令。实现虚拟化管理程序扩展时的其他同步要求，请参见18.5.3节。
 
 如果没有实现基于页面的虚拟内存，内存访问将同步检查PMP设置，因此没有SFENCE.VMA是必需的。
+
+# BOOM V3 ISSUE 模块解析
+
+## issue slot
+
+![1731223168047](image/diplomacy/1731223168047.png)
+
+首先明确：这个slot需要能写入东西，能读出东西，控制信号可以改变（唤醒）
+
+写入就是dispatch模块写入，读出就是准备好了可以发射了
+
+然後列出状态机:
+
+```
+trait IssueUnitConstants
+{
+  // invalid  : slot holds no valid uop.
+  // s_valid_1: slot holds a valid uop.
+  // s_valid_2: slot holds a store-like uop that may be broken into two micro-ops.
+  val s_invalid :: s_valid_1 :: s_valid_2 :: Nil = Enum(3)
+}
+```
+
+可以看到有三个状态
+
+```
+  val io = IO(new IssueSlotIO(numWakeupPorts))
+
+  // slot invalid?
+  // slot is valid, holding 1 uop
+  // slot is valid, holds 2 uops (like a store)
+  def is_invalid = state === s_invalid
+  def is_valid = state =/= s_invalid
+
+  val next_state      = Wire(UInt()) // the next state of this slot (which might then get moved to a new slot)
+  val next_uopc       = Wire(UInt()) // the next uopc of this slot (which might then get moved to a new slot)
+  val next_lrs1_rtype = Wire(UInt()) // the next reg type of this slot (which might then get moved to a new slot)
+  val next_lrs2_rtype = Wire(UInt()) // the next reg type of this slot (which might then get moved to a new slot)
+
+  val state = RegInit(s_invalid)
+  val p1    = RegInit(false.B)
+  val p2    = RegInit(false.B)
+  val p3    = RegInit(false.B)
+  val ppred = RegInit(false.B)
+
+  // Poison if woken up by speculative load.
+  // Poison lasts 1 cycle (as ldMiss will come on the next cycle).
+  // SO if poisoned is true, set it to false!
+  val p1_poisoned = RegInit(false.B)
+  val p2_poisoned = RegInit(false.B)
+  p1_poisoned := false.B
+  p2_poisoned := false.B
+  val next_p1_poisoned = Mux(io.in_uop.valid, io.in_uop.bits.iw_p1_poisoned, p1_poisoned)
+  val next_p2_poisoned = Mux(io.in_uop.valid, io.in_uop.bits.iw_p2_poisoned, p2_poisoned)
+
+  val slot_uop = RegInit(NullMicroOp)
+  val next_uop = Mux(io.in_uop.valid, io.in_uop.bits, slot_uop)
+```
+
+接下来为主要信号，next_state這個slot的下一個狀態,之后这些next前缀的都是这个意思,他们是去构造压缩式队列使用的,然后state是这个slot的状态,p1,p2,p3表示操作数是否准备好了,ppred涉及到load的推测唤醒,但目前他们文档说不支持,下面的p1_poisoned表示推测唤醒失败,需要将这个p1给置为false,next_p1_poisoned是指输入的bit的p1是否被poisoned,slot_uop保存这个slot内容,然后next_uop,仍然用于压缩队列
+
+```
+  //-----------------------------------------------------------------------------
+  // next slot state computation
+  // compute the next state for THIS entry slot (in a collasping queue, the
+  // current uop may get moved elsewhere, and a new uop can enter
+
+  when (io.kill) {
+    state := s_invalid
+  } .elsewhen (io.in_uop.valid) {
+    state := io.in_uop.bits.iw_state
+  } .elsewhen (io.clear) {
+    state := s_invalid
+  } .otherwise {
+    state := next_state
+  }
+
+```
+
+然后就是下一个slot状态计算,kill表示冲刷流水线,clear表示slot被移到其他的地方了,如果输入的uop.valid有效,就把state置为输入uop的state,否则就为next_state
+
+```
+  //-----------------------------------------------------------------------------
+  // "update" state
+  // compute the next state for the micro-op in this slot. This micro-op may
+  // be moved elsewhere, so the "next_state" travels with it.
+
+  // defaults
+  next_state := state
+  next_uopc := slot_uop.uopc
+  next_lrs1_rtype := slot_uop.lrs1_rtype
+  next_lrs2_rtype := slot_uop.lrs2_rtype
+
+  when (io.kill) {
+    next_state := s_invalid
+  } .elsewhen ((io.grant && (state === s_valid_1)) ||
+    (io.grant && (state === s_valid_2) && p1 && p2 && ppred)) {
+    // try to issue this uop.
+    when (!(io.ldspec_miss && (p1_poisoned || p2_poisoned))) {
+      next_state := s_invalid
+    }
+  } .elsewhen (io.grant && (state === s_valid_2)) {
+    when (!(io.ldspec_miss && (p1_poisoned || p2_poisoned))) {
+      next_state := s_valid_1
+      when (p1) {
+        slot_uop.uopc := uopSTD
+        next_uopc := uopSTD
+        slot_uop.lrs1_rtype := RT_X
+        next_lrs1_rtype := RT_X
+      } .otherwise {
+        slot_uop.lrs2_rtype := RT_X
+        next_lrs2_rtype := RT_X
+      }
+    }
+  }
+
+  when (io.in_uop.valid) {
+    slot_uop := io.in_uop.bits
+    assert (is_invalid || io.clear || io.kill, "trying to overwrite a valid issue slot.")
+  }
+```
+
+当冲刷流水线,就把next_state设置为无效,当grant为高,可以并且状态为v1(s_valid_1),或者是v2,且操作数准备好了,就说明可以发射了,如果没有遇到load推测唤醒失败,就把next_state设置为s_invalid,假如state为v2并且grant,如果没发生load推测唤醒失败,就把next_state设置为v1,然后看准备好的是数据还是地址,分别被uopc赋值为相应类型,如果in_uop.valid,就把slot更新为io.in_uop.bits
+
+```
+  // Wakeup Compare Logic
+
+  // these signals are the "next_p*" for the current slot's micro-op.
+  // they are important for shifting the current slot_uop up to an other entry.
+  val next_p1 = WireInit(p1)
+  val next_p2 = WireInit(p2)
+  val next_p3 = WireInit(p3)
+  val next_ppred = WireInit(ppred)
+
+  when (io.in_uop.valid) {
+    p1 := !(io.in_uop.bits.prs1_busy)
+    p2 := !(io.in_uop.bits.prs2_busy)
+    p3 := !(io.in_uop.bits.prs3_busy)
+    ppred := !(io.in_uop.bits.ppred_busy)
+  }
+
+  when (io.ldspec_miss && next_p1_poisoned) {
+    assert(next_uop.prs1 =/= 0.U, "Poison bit can't be set for prs1=x0!")
+    p1 := false.B
+  }
+  when (io.ldspec_miss && next_p2_poisoned) {
+    assert(next_uop.prs2 =/= 0.U, "Poison bit can't be set for prs2=x0!")
+    p2 := false.B
+  }
+
+  for (i <- 0 until numWakeupPorts) {
+    when (io.wakeup_ports(i).valid &&
+         (io.wakeup_ports(i).bits.pdst === next_uop.prs1)) {
+      p1 := true.B
+    }
+    when (io.wakeup_ports(i).valid &&
+         (io.wakeup_ports(i).bits.pdst === next_uop.prs2)) {
+      p2 := true.B
+    }
+    when (io.wakeup_ports(i).valid &&
+         (io.wakeup_ports(i).bits.pdst === next_uop.prs3)) {
+      p3 := true.B
+    }
+  }
+  when (io.pred_wakeup_port.valid && io.pred_wakeup_port.bits === next_uop.ppred) {
+    ppred := true.B
+  }
+
+  for (w <- 0 until memWidth) {
+    assert (!(io.spec_ld_wakeup(w).valid && io.spec_ld_wakeup(w).bits === 0.U),
+      "Loads to x0 should never speculatively wakeup other instructions")
+  }
+
+  // TODO disable if FP IQ.
+  for (w <- 0 until memWidth) {
+    when (io.spec_ld_wakeup(w).valid &&
+      io.spec_ld_wakeup(w).bits === next_uop.prs1 &&
+      next_uop.lrs1_rtype === RT_FIX) {
+      p1 := true.B
+      p1_poisoned := true.B
+      assert (!next_p1_poisoned)
+    }
+    when (io.spec_ld_wakeup(w).valid &&
+      io.spec_ld_wakeup(w).bits === next_uop.prs2 &&
+      next_uop.lrs2_rtype === RT_FIX) {
+      p2 := true.B
+      p2_poisoned := true.B
+      assert (!next_p2_poisoned)
+    }
+  }
+```
+
+接下来是唤醒逻辑,首先定义了四个next前缀的信号,这些信号用于压缩队列,然后就是如果输入有效数据,检查输入的rs1,rs2,rs3是否busy,也就是是否被写入prf(在Busytable没表项),如果推测唤醒失败,就把p1置为false,其他同理,然后检查每个wakeupport,如果有port有效,并且pdst等于slot的src,就把该寄存器ready,然后是推测唤醒逻辑:
+
+TODO
+
+```
+  // Request Logic
+  io.request := is_valid && p1 && p2 && p3 && ppred && !io.kill
+  val high_priority = slot_uop.is_br || slot_uop.is_jal || slot_uop.is_jalr
+  io.request_hp := io.request && high_priority
+
+  when (state === s_valid_1) {
+    io.request := p1 && p2 && p3 && ppred && !io.kill
+  } .elsewhen (state === s_valid_2) {
+    io.request := (p1 || p2) && ppred && !io.kill
+  } .otherwise {
+    io.request := false.B
+  }
+
+```
+
+接下来为req逻辑,只要p1,p2,p3准备好就可以req了,由于大部分指令为两个src,所以p3一般为默认值,也就是true,最后就是一些连线逻辑
+
+## Issue Unit
+
+```
+/**
+ * Abstract top level issue unit
+ *
+ * @param numIssueSlots depth of issue queue
+ * @param issueWidth amoutn of operations that can be issued at once
+ * @param numWakeupPorts number of wakeup ports for issue unit
+ * @param iqType type of issue queue (mem, int, fp)
+ */
+abstract class IssueUnit(
+  val numIssueSlots: Int,
+  val issueWidth: Int,
+  val numWakeupPorts: Int,
+  val iqType: BigInt,
+  val dispatchWidth: Int)
+  (implicit p: Parameters)
+  extends BoomModule
+  with IssueUnitConstants
+{
+  val io = IO(new IssueUnitIO(issueWidth, numWakeupPorts, dispatchWidth))
+
+  //-------------------------------------------------------------
+  // Set up the dispatch uops
+  // special case "storing" 2 uops within one issue slot.
+
+  val dis_uops = Array.fill(dispatchWidth) {Wire(new MicroOp())}
+  for (w <- 0 until dispatchWidth) {
+    dis_uops(w) := io.dis_uops(w).bits
+    dis_uops(w).iw_p1_poisoned := false.B
+    dis_uops(w).iw_p2_poisoned := false.B
+    dis_uops(w).iw_state := s_valid_1
+
+    if (iqType == IQT_MEM.litValue || iqType == IQT_INT.litValue) {
+      // For StoreAddrGen for Int, or AMOAddrGen, we go to addr gen state
+      when ((io.dis_uops(w).bits.uopc === uopSTA && io.dis_uops(w).bits.lrs2_rtype === RT_FIX) ||
+             io.dis_uops(w).bits.uopc === uopAMO_AG) {
+        dis_uops(w).iw_state := s_valid_2
+        // For store addr gen for FP, rs2 is the FP register, and we don't wait for that here
+      } .elsewhen (io.dis_uops(w).bits.uopc === uopSTA && io.dis_uops(w).bits.lrs2_rtype =/= RT_FIX) {
+        dis_uops(w).lrs2_rtype := RT_X
+        dis_uops(w).prs2_busy  := false.B
+      }
+      dis_uops(w).prs3_busy := false.B
+    } else if (iqType == IQT_FP.litValue) {
+      // FP "StoreAddrGen" is really storeDataGen, and rs1 is the integer address register
+      when (io.dis_uops(w).bits.uopc === uopSTA) {
+        dis_uops(w).lrs1_rtype := RT_X
+        dis_uops(w).prs1_busy  := false.B
+      }
+    }
+
+    if (iqType != IQT_INT.litValue) {
+      assert(!(io.dis_uops(w).bits.ppred_busy && io.dis_uops(w).valid))
+      dis_uops(w).ppred_busy := false.B
+    }
+  }
+
+  
+```
+
+我们这个抽象类,主要参数有issue queue大小,一次可以发射多少,唤醒port,issue的类型(mem,int,fp),然后创建了一个dis_uops,将来自dispatch的信号传入,然后将dip_uops初始化为dispatch数据,状态设置为v1(代表一般指令,),然后根据iq类型来分别进一步初始化,对于int类型的之后将prs3置为空闲,而mem不仅置为空闲,还检查是STA对state初始化为v2
+
+```
+  //-------------------------------------------------------------
+  // Issue Table
+
+  val slots = for (i <- 0 until numIssueSlots) yield { val slot = Module(new IssueSlot(numWakeupPorts)); slot }
+  val issue_slots = VecInit(slots.map(_.io))
+
+  for (i <- 0 until numIssueSlots) {
+    issue_slots(i).wakeup_ports     := io.wakeup_ports
+    issue_slots(i).pred_wakeup_port := io.pred_wakeup_port
+    issue_slots(i).spec_ld_wakeup   := io.spec_ld_wakeup
+    issue_slots(i).ldspec_miss      := io.ld_miss
+    issue_slots(i).brupdate         := io.brupdate
+    issue_slots(i).kill             := io.flush_pipeline
+  }
+
+  io.event_empty := !(issue_slots.map(s => s.valid).reduce(_|_))
+
+  val count = PopCount(slots.map(_.io.valid))
+  dontTouch(count)
+```
+
+接下来就是创建slot,连线,
+
+## IssueUnitStatic
+
+然后讲解非压缩队列
+
+```
+  val entry_wen_oh = VecInit(Seq.fill(numIssueSlots){ Wire(Bits(dispatchWidth.W)) })
+  for (i <- 0 until numIssueSlots) {
+    issue_slots(i).in_uop.valid := entry_wen_oh(i).orR
+    issue_slots(i).in_uop.bits  := Mux1H(entry_wen_oh(i), dis_uops)
+    issue_slots(i).clear        := false.B
+  }
+```
+
+首先是表项写使能,这个entry_wen_oh会在后面赋值,这个是dispatch传来的,然后将数据传入issue slot,这里使用one hot 编码,这个会在之后讲解,将clear设置为false
+
+```
+  //-------------------------------------------------------------
+  // Dispatch/Entry Logic
+  // find a slot to enter a new dispatched instruction
+
+  val entry_wen_oh_array = Array.fill(numIssueSlots,dispatchWidth){false.B}
+  var allocated = VecInit(Seq.fill(dispatchWidth){false.B}) // did an instruction find an issue width?
+
+  for (i <- 0 until numIssueSlots) {
+    var next_allocated = Wire(Vec(dispatchWidth, Bool()))
+    var can_allocate = !(issue_slots(i).valid)
+
+    for (w <- 0 until dispatchWidth) {
+      entry_wen_oh_array(i)(w) = can_allocate && !(allocated(w))
+
+      next_allocated(w) := can_allocate | allocated(w)
+      can_allocate = can_allocate && allocated(w)
+    }
+
+    allocated = next_allocated
+  }
+
+```
+
+这是分发逻辑,首先创建一个entry_wen_oh_array,记录每个slot是否有dispatch的指令,然后allocated表示这个指令已经被分配了,然后进入两重循环,最底层循环就是看看这个slot是否空闲,如果空闲就将使能信号写入进去,然后把这个表项锁住,也就是将can_allocate置低,举例:
+
+假设dispatch为4位使用一个四位变量allocate=(0,0,0,0)表示指令都没分发出去,假设指令0,找到了一个空slot,我们就可以把这个空槽占据了,然后next_allocate=(1,0,0,0)然后can_allocate由于allocated为false,所以置低,最后第一次循环完,next_allocate为(1,0,0,0),can_allocate=false,这个slot接受不到其他的指令了,已经被指令0占据了,内层循环完毕,把next_allocate赋值给allocate
+
+```
+  // if we can find an issue slot, do we actually need it?
+  // also, translate from Scala data structures to Chisel Vecs
+  for (i <- 0 until numIssueSlots) {
+    val temp_uop_val = Wire(Vec(dispatchWidth, Bool()))
+
+    for (w <- 0 until dispatchWidth) {
+      // TODO add ctrl bit for "allocates iss_slot"
+      temp_uop_val(w) := io.dis_uops(w).valid &&
+                         !dis_uops(w).exception &&
+                         !dis_uops(w).is_fence &&
+                         !dis_uops(w).is_fencei &&
+                         entry_wen_oh_array(i)(w)
+    }
+    entry_wen_oh(i) := temp_uop_val.asUInt
+  }
+
+  for (w <- 0 until dispatchWidth) {
+    io.dis_uops(w).ready := allocated(w)
+  }
+
+```
+
+这段代码将上面得出的wen信号进一步处理,然后将wen赋值给一开始的entry_wen_oh,这样最上面的代码就可以找到哪个slot这次会被写入了,并且这个也得出了是那一条指令占据了哪个slot,假设有4个slot,dis大小也是4,最后这个entry_wen_oh可能是(1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1),也就是得到了每条指令要写入哪个slot的信息,完成分配的信号就是allocate对应位为1,
+
+```
+  for (w <- 0 until issueWidth) {
+    io.iss_valids(w) := false.B
+    io.iss_uops(w)   := NullMicroOp
+    // unsure if this is overkill
+    io.iss_uops(w).prs1 := 0.U
+    io.iss_uops(w).prs2 := 0.U
+    io.iss_uops(w).prs3 := 0.U
+    io.iss_uops(w).lrs1_rtype := RT_X
+    io.iss_uops(w).lrs2_rtype := RT_X
+  }
+```
+
+接下来为仲裁逻辑,首先对issue信号初始化
+
+```
+// TODO can we use flatten to get an array of bools on issue_slot(*).request?
+  val lo_request_not_satisfied = Array.fill(numIssueSlots){Bool()}
+  val hi_request_not_satisfied = Array.fill(numIssueSlots){Bool()}
+
+  for (i <- 0 until numIssueSlots) {
+    lo_request_not_satisfied(i) = issue_slots(i).request
+    hi_request_not_satisfied(i) = issue_slots(i).request_hp
+    issue_slots(i).grant := false.B // default
+  }
+
+  for (w <- 0 until issueWidth) {
+    var port_issued = false.B
+
+    // first look for high priority requests
+    for (i <- 0 until numIssueSlots) {
+      val can_allocate = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
+
+      when (hi_request_not_satisfied(i) && can_allocate && !port_issued) {
+        issue_slots(i).grant := true.B
+        io.iss_valids(w)     := true.B
+        io.iss_uops(w)       := issue_slots(i).uop
+      }
+
+      val port_already_in_use     = port_issued
+      port_issued                 = (hi_request_not_satisfied(i) && can_allocate) | port_issued
+      // deassert lo_request if hi_request is 1.
+      lo_request_not_satisfied(i) = (lo_request_not_satisfied(i) && !hi_request_not_satisfied(i))
+      // if request is 0, stay 0. only stay 1 if request is true and can't allocate
+      hi_request_not_satisfied(i) = (hi_request_not_satisfied(i) && (!can_allocate || port_already_in_use))
+    }
+
+    // now look for low priority requests
+    for (i <- 0 until numIssueSlots) {
+      val can_allocate = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
+
+      when (lo_request_not_satisfied(i) && can_allocate && !port_issued) {
+        issue_slots(i).grant := true.B
+        io.iss_valids(w)     := true.B
+        io.iss_uops(w)       := issue_slots(i).uop
+      }
+
+      val port_already_in_use     = port_issued
+      port_issued                 = (lo_request_not_satisfied(i) && can_allocate) | port_issued
+      // if request is 0, stay 0. only stay 1 if request is true and can't allocate or port already in use
+      lo_request_not_satisfied(i) = (lo_request_not_satisfied(i) && (!can_allocate || port_already_in_use))
+    }
+  }
+```
+
+首先把低级req和高级req从issue slot读出来,将grant置为低(初始化),然后进入仲裁逻辑,首先检查高优先级的req,首先有一个can_allocate信号,也就是匹配FU,如果匹配到FU,并且有高优先级请求,并且port_issue没有置为高,就发出grant信号,表示可以发射了,将slot的uop读出来,然后将这个port_issued置为高,接下来重新赋值低位请求,必须没有高位请求,低位请求才生效,如果有高级请求,但FU没匹配成功或者这个FU在用,就一直置为高位请求,接下来就是低级请求,其和高级请求的思路类似
+
+## IssueUnitCollapsing
+
+```
+  //-------------------------------------------------------------
+  // Figure out how much to shift entries by
+
+  val maxShift = dispatchWidth
+  val vacants = issue_slots.map(s => !(s.valid)) ++ io.dis_uops.map(_.valid).map(!_.asBool)
+  val shamts_oh = Array.fill(numIssueSlots+dispatchWidth) {Wire(UInt(width=maxShift.W))}
+  // track how many to shift up this entry by by counting previous vacant spots
+  def SaturatingCounterOH(count_oh:UInt, inc: Bool, max: Int): UInt = {
+     val next = Wire(UInt(width=max.W))
+     next := count_oh
+     when (count_oh === 0.U && inc) {
+       next := 1.U
+     } .elsewhen (!count_oh(max-1) && inc) {
+       next := (count_oh << 1.U)
+     }
+     next
+  }
+  shamts_oh(0) := 0.U
+  for (i <- 1 until numIssueSlots + dispatchWidth) {
+    shamts_oh(i) := SaturatingCounterOH(shamts_oh(i-1), vacants(i-1), maxShift)
+  }
+```
+
+首先定义最大位移的数字maxshift,然后vacants就是把issue slot和要写入的看看是不是有效的,之后讲解SaturatingCounterOH方法,这个方法定义了每个位置要位移多少,首先最底部的绝对不用位移,之后的位置位移取决于下面的是否是空的,如果是空的,就在下面的一个位置位移的基础上左移一位(one hot编码),如果不是one hot,只要在下面位置位移的基础+1即可,然后我们经过这个循环就得到了每一项要位移的数(one hot),
+
+> 不太明白这个maxshift为什么要以dispatchwidth为最大值,不该为issuewidth吗
+
+```
+  //-------------------------------------------------------------
+
+  // which entries' uops will still be next cycle? (not being issued and vacated)
+  val will_be_valid = (0 until numIssueSlots).map(i => issue_slots(i).will_be_valid) ++
+                      (0 until dispatchWidth).map(i => io.dis_uops(i).valid &&
+                                                        !dis_uops(i).exception &&
+                                                        !dis_uops(i).is_fence &&
+                                                        !dis_uops(i).is_fencei)
+
+  val uops = issue_slots.map(s=>s.out_uop) ++ dis_uops.map(s=>s)
+  for (i <- 0 until numIssueSlots) {
+    issue_slots(i).in_uop.valid := false.B
+    issue_slots(i).in_uop.bits  := uops(i+1)
+    for (j <- 1 to maxShift by 1) {
+      when (shamts_oh(i+j) === (1 << (j-1)).U) {
+        issue_slots(i).in_uop.valid := will_be_valid(i+j)
+        issue_slots(i).in_uop.bits  := uops(i+j)
+      }
+    }
+    issue_slots(i).clear        := shamts_oh(i) =/= 0.U
+  }
+
+```
+
+这几段代码主要讲的就是issue和dispatch的表项是否在下个周期还有效,也就是他是否发射出去了或者被清除了,然后循环内主要就是对slot移位,就是设置一个小循环,这个小循环检测是哪个移位进来的,
+
+举例:
+
+假设我们有四个slot,然后slot(0)是空的,其他都有数据,那么shamt(0)=0,shamt(1)=01,shamt(2)=01,shamt(3)=01,所以我们移位后就是3->2,2->1,1->0,假设i=0,小循环第一次进入when,此时j=1,这就完成了1->0的操作,由于slot(1)不是空的,所以这个循环只会进入一次when,最后出小循环将slot(0)的clear根据shamt(0)置为false
+
+> 最后一步的clear对移位后有数据的没什莫影响,因为in_valid优先级大于clear,但对高位置的slot有影响,比如这里就是对3有影响(假设没有指令dispatch进来)
+
+```
+  //-------------------------------------------------------------
+  // Dispatch/Entry Logic
+  // did we find a spot to slide the new dispatched uops into?
+
+  val will_be_available = (0 until numIssueSlots).map(i =>
+                            (!issue_slots(i).will_be_valid || issue_slots(i).clear) && !(issue_slots(i).in_uop.valid))
+  val num_available = PopCount(will_be_available)
+  for (w <- 0 until dispatchWidth) {
+    io.dis_uops(w).ready := RegNext(num_available > w.U)
+  }
+```
+
+这段代码就是检测dispatch的指令是否写进来,will_be_available检查空的slot并且之后还被移入数据,然后num_available得到空slot的数目,如果num_available大于dispatchwidth,就说明分发好了,这里也就是空的slot大于分发的数目,注意,这里不保证每个都写进去,
+
+```
+
+  //-------------------------------------------------------------
+  // Issue Select Logic
+
+  // set default
+  for (w <- 0 until issueWidth) {
+    io.iss_valids(w) := false.B
+    io.iss_uops(w)   := NullMicroOp
+    // unsure if this is overkill
+    io.iss_uops(w).prs1 := 0.U
+    io.iss_uops(w).prs2 := 0.U
+    io.iss_uops(w).prs3 := 0.U
+    io.iss_uops(w).lrs1_rtype := RT_X
+    io.iss_uops(w).lrs2_rtype := RT_X
+  }
+
+  val requests = issue_slots.map(s => s.request)
+  val port_issued = Array.fill(issueWidth){Bool()}
+  for (w <- 0 until issueWidth) {
+    port_issued(w) = false.B
+  }
+
+  for (i <- 0 until numIssueSlots) {
+    issue_slots(i).grant := false.B
+    var uop_issued = false.B
+
+    for (w <- 0 until issueWidth) {
+      val can_allocate = (issue_slots(i).uop.fu_code & io.fu_types(w)) =/= 0.U
+
+      when (requests(i) && !uop_issued && can_allocate && !port_issued(w)) {
+        issue_slots(i).grant := true.B
+        io.iss_valids(w) := true.B
+        io.iss_uops(w) := issue_slots(i).uop
+      }
+      val was_port_issued_yet = port_issued(w)
+      port_issued(w) = (requests(i) && !uop_issued && can_allocate) | port_issued(w)
+      uop_issued = (requests(i) && can_allocate && !was_port_issued_yet) | uop_issued
+    }
+  }
+```
+
+最后是仲裁逻辑,首先将issue信息初始化,然后找slot的req,之后去寻找可以issue的项,这里和非压缩类似,
+
+## 总结
+
+无论是压缩还是非压缩,issue都使用相同的slot,而且仲裁逻辑都是一样的,也就是从低slot扫描到高slot,直到凑齐发射指令
