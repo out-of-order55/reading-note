@@ -257,7 +257,7 @@ class MySoC(implicit p: Parameters) extends LazyModule {
   require (0.0 <= q && q < 1)
 ```
 
-首先可以看到他创建了一个AXI4AdapterNode,这个主要就是master原封不动传进来,slave参数也是原封不动传进来,然后q就是请求延迟的概率
+首先可以看到他创建了一个AXI4AdapterNode,这个主要就是master原封不动传进来,slave也是原封不动传进来（只可改变参数，但边不可改变）,然后q就是请求延迟的概率
 
 然后在lazymodule定义了一个feed函数
 
@@ -1303,3 +1303,368 @@ abstract class IssueUnit(
 ## 总结
 
 无论是压缩还是非压缩,issue都使用相同的slot,而且仲裁逻辑都是一样的,也就是从低slot扫描到高slot,直到凑齐发射指令
+
+# BOOM RENAME
+
+boom采用的是统一的PRF结构，
+
+![1731307352707](image/diplomacy/1731307352707.png)
+
+RAT就是图中的map table，busytable揭示每个物理寄存器的忙碌情况，
+
+## Busy table
+
+busytable在唤醒阶段把寄存器设置为空闲，在rename阶段将寄存器设置为忙
+
+首先列出输入输出信号
+
+```
+  val io = IO(new BoomBundle()(p) {
+    val ren_uops = Input(Vec(plWidth, new MicroOp))
+    val busy_resps = Output(Vec(plWidth, new BusyResp))
+    val rebusy_reqs = Input(Vec(plWidth, Bool()))
+
+    val wb_pdsts = Input(Vec(numWbPorts, UInt(pregSz.W)))
+    val wb_valids = Input(Vec(numWbPorts, Bool()))
+
+    val debug = new Bundle { val busytable = Output(Bits(numPregs.W)) }
+  })
+
+```
+
+ren_uops表示查询busytable，busy_reps表示寄存器的忙碌状态，wb前缀的表示写回阶段要更新的寄存器状态，最后一个是debug信号
+
+```
+  val busy_table = RegInit(0.U(numPregs.W))
+  // Unbusy written back registers.
+  val busy_table_wb = busy_table & ~(io.wb_pdsts zip io.wb_valids)
+    .map {case (pdst, valid) => UIntToOH(pdst) & Fill(numPregs, valid.asUInt)}.reduce(_|_)
+  // Rebusy newly allocated registers.
+  val busy_table_next = busy_table_wb | (io.ren_uops zip io.rebusy_reqs)
+    .map {case (uop, req) => UIntToOH(uop.pdst) & Fill(numPregs, req.asUInt)}.reduce(_|_)
+
+  busy_table := busy_table_next
+```
+
+接下来是主要模块，首先将写回的寄存器unbusy，我们看busy_table_wb，首先看io.wb_pdsts zip io.wb_valids表示将两个作为一个元组，然后使用map函数，对每个院组都进行操作，操作的内容是后面｛｝内容，这个｛首先使用模式匹配case，然后输出的值是=>后面的值，也就是把写回的寄存器变成oh编码，然后把这些元素通过reduce按位或，得到写回寄存器的oh编码，然后取非再&busytable，就相当于释放了写回的寄存器
+
+之后的busy_table_next，就是为寄存器分配忙位
+
+```
+  // Read the busy table.
+  for (i <- 0 until plWidth) {
+    val prs1_was_bypassed = (0 until i).map(j =>
+      io.ren_uops(i).lrs1 === io.ren_uops(j).ldst && io.rebusy_reqs(j)).foldLeft(false.B)(_||_)
+    val prs2_was_bypassed = (0 until i).map(j =>
+      io.ren_uops(i).lrs2 === io.ren_uops(j).ldst && io.rebusy_reqs(j)).foldLeft(false.B)(_||_)
+    val prs3_was_bypassed = (0 until i).map(j =>
+      io.ren_uops(i).lrs3 === io.ren_uops(j).ldst && io.rebusy_reqs(j)).foldLeft(false.B)(_||_)
+
+    io.busy_resps(i).prs1_busy := busy_table(io.ren_uops(i).prs1) || prs1_was_bypassed && bypass.B
+    io.busy_resps(i).prs2_busy := busy_table(io.ren_uops(i).prs2) || prs2_was_bypassed && bypass.B
+    io.busy_resps(i).prs3_busy := busy_table(io.ren_uops(i).prs3) || prs3_was_bypassed && bypass.B
+    if (!float) io.busy_resps(i).prs3_busy := false.B
+  }
+
+  io.debug.busytable := busy_table
+```
+
+然后就是读busytable，这个的意思就是先检查写入的新映射关系有没有和src1一样的，有的话就说明这个可能有依赖（也即是RAW），也就是这个寄存器在使用，之后只要busytable和prs1_was_bypassed一个成立，就说明这个寄存器在使用
+
+## Map table
+
+其实就是RAT，首先先把交互信号放上来，以供后续阅读
+
+```
+class MapReq(val lregSz: Int) extends Bundle
+{
+  val lrs1 = UInt(lregSz.W)
+  val lrs2 = UInt(lregSz.W)
+  val lrs3 = UInt(lregSz.W)
+  val ldst = UInt(lregSz.W)
+}
+
+class MapResp(val pregSz: Int) extends Bundle
+{
+  val prs1 = UInt(pregSz.W)
+  val prs2 = UInt(pregSz.W)
+  val prs3 = UInt(pregSz.W)
+  val stale_pdst = UInt(pregSz.W)
+}
+
+class RemapReq(val lregSz: Int, val pregSz: Int) extends Bundle
+{
+  val ldst = UInt(lregSz.W)
+  val pdst = UInt(pregSz.W)
+  val valid = Bool()
+}
+```
+
+然后就是Maptable的IO信号了，主要就是映射请求，映射答复，重新映射，保存snapshot，恢复snapshot
+
+```
+  val io = IO(new BoomBundle()(p) {
+    // Logical sources -> physical sources.
+    val map_reqs    = Input(Vec(plWidth, new MapReq(lregSz)))
+    val map_resps   = Output(Vec(plWidth, new MapResp(pregSz)))
+
+    // Remapping an ldst to a newly allocated pdst?
+    val remap_reqs  = Input(Vec(plWidth, new RemapReq(lregSz, pregSz)))
+
+    // Dispatching branches: need to take snapshots of table state.
+    val ren_br_tags = Input(Vec(plWidth, Valid(UInt(brTagSz.W))))
+
+    // Signals for restoring state following misspeculation.
+    val brupdate      = Input(new BrUpdateInfo)
+    val rollback    = Input(Bool())
+  })
+```
+
+接下来就是这个模块的主要信号，首先map_table就是这个模块的核心了，存储寄存器映射关系的，然后就是snapshot，这里为什么要remap？就是把最新的寄存器关系写进去，具体需要看重命名过程干了什么（逻辑源寄存器读RAT，目的寄存器在freelist找空闲，目的寄存器读RAT，将读出的值写入ROB，目的寄存器写入RAT，更新新的映射关系）这样其实就理解了设置这些信号的含义，remap_pdsts就是把物理寄存器号提取出来，如果一周期重命名2条，那么这个就是一个大小为2的向量，remap_ldsts_oh就是给每个逻辑寄存器编码，假设两条指令目的寄存器为1，3，那么编码后的就是（32‘b...10,32'b...1000）
+
+```
+  // The map table register array and its branch snapshots.
+  val map_table = RegInit(VecInit(Seq.fill(numLregs){0.U(pregSz.W)}))
+  val br_snapshots = Reg(Vec(maxBrCount, Vec(numLregs, UInt(pregSz.W))))
+
+  // The intermediate states of the map table following modification by each pipeline slot.
+  val remap_table = Wire(Vec(plWidth+1, Vec(numLregs, UInt(pregSz.W))))
+
+  // Uops requesting changes to the map table.
+  val remap_pdsts = io.remap_reqs map (_.pdst)
+  val remap_ldsts_oh = io.remap_reqs map (req => UIntToOH(req.ldst) & Fill(numLregs, req.valid.asUInt))
+```
+
+然后弄明白新的每个指令新的映射关系，第一个意思就是把0号寄存器清0，如果不是0号寄存器，就设置一个remapped_row，这个的大小是plwidth的大小，这个之后的意思就是，为每个逻辑寄存器找到他的映射关系是来自RAT还是传入的映射关系,我们首先需要知道scanleft的意思，这个的工作模式如下（从左到右依次是reduce，fold，scan），这个remapped_row干的事情就是先把ldst位提取出来，这表示哪个逻辑寄存器是有更新请求，然后zip pdst形成元组，假设有如下映射ldst1->pdst2,ldst3->pdst4,这里前面是逻辑。后面是物理，假设一周期2条指令，i=1，这个zip形成的元组就是（true，2），（false，2），然后scanleft（有累积性）的初值为map_table（1）,也就是remapped_row第0个元素为来自map的值，然后这句话生成的元组就是（map，pdst2，pdst2），map为来自map-table的物理寄存器，最后把这些赋值给remaptable,然后假如i=3，remapped_row就是（map，map，pdst4），此时remap_table（1）为（0，pdst2，map，map，...）remap（2）为（0，pdst2，map，pdst4，...）所以这里可以看到remaptable的最高索引才是正确的映射关系（巧妙但晦涩难懂的操作）
+
+![1731476588727](image/diplomacy/1731476588727.png)
+
+```
+  // Figure out the new mappings seen by each pipeline slot.
+  for (i <- 0 until numLregs) {
+    if (i == 0 && !float) {
+      for (j <- 0 until plWidth+1) {
+        remap_table(j)(i) := 0.U
+      }
+    } else {
+      val remapped_row = (remap_ldsts_oh.map(ldst => ldst(i)) zip remap_pdsts)
+        .scanLeft(map_table(i)) {case (pdst, (ldst, new_pdst)) => Mux(ldst, new_pdst, pdst)}
+
+      for (j <- 0 until plWidth+1) {
+        remap_table(j)(i) := remapped_row(j)
+      }
+    }
+  }
+```
+
+然后更新新的映射关系，最后就是读map，注意这个处理了读出的映射关系是来自map_table还是remap请求(处理RAW)，当i=0，映射关系来自RAT，（也就是第1条指令，最旧的指令）只讲解i=1情况的prs1，foldleft和scan类似，但只输出最终结果，所以这里就是检查第一条的目的寄存器和这一条指令（也就是第二条）的源寄存器是否相等，如果相等就使用新的映射
+
+```
+  when (io.brupdate.b2.mispredict) {
+    // Restore the map table to a branch snapshot.
+    map_table := br_snapshots(io.brupdate.b2.uop.br_tag)
+  } .otherwise {
+    // Update mappings.
+    map_table := remap_table(plWidth)
+  }
+
+  // Read out mappings.
+  for (i <- 0 until plWidth) {
+    io.map_resps(i).prs1       := (0 until i).foldLeft(map_table(io.map_reqs(i).lrs1)) ((p,k) =>
+      Mux(bypass.B && io.remap_reqs(k).valid && io.remap_reqs(k).ldst === io.map_reqs(i).lrs1, io.remap_reqs(k).pdst, p))
+    io.map_resps(i).prs2       := (0 until i).foldLeft(map_table(io.map_reqs(i).lrs2)) ((p,k) =>
+      Mux(bypass.B && io.remap_reqs(k).valid && io.remap_reqs(k).ldst === io.map_reqs(i).lrs2, io.remap_reqs(k).pdst, p))
+    io.map_resps(i).prs3       := (0 until i).foldLeft(map_table(io.map_reqs(i).lrs3)) ((p,k) =>
+      Mux(bypass.B && io.remap_reqs(k).valid && io.remap_reqs(k).ldst === io.map_reqs(i).lrs3, io.remap_reqs(k).pdst, p))
+    io.map_resps(i).stale_pdst := (0 until i).foldLeft(map_table(io.map_reqs(i).ldst)) ((p,k) =>
+      Mux(bypass.B && io.remap_reqs(k).valid && io.remap_reqs(k).ldst === io.map_reqs(i).ldst, io.remap_reqs(k).pdst, p))
+
+    if (!float) io.map_resps(i).prs3 := DontCare
+  }
+```
+
+然后这个链接对高阶函数做了简单总结：[高级设计](https://zhuanlan.zhihu.com/p/350301092)
+
+## Free list
+
+先列出IO信号
+
+```
+  val io = IO(new BoomBundle()(p) {
+    // Physical register requests.
+    val reqs          = Input(Vec(plWidth, Bool()))
+    val alloc_pregs   = Output(Vec(plWidth, Valid(UInt(pregSz.W))))
+
+    // Pregs returned by the ROB.
+    val dealloc_pregs = Input(Vec(plWidth, Valid(UInt(pregSz.W))))
+
+    // Branch info for starting new allocation lists.
+    val ren_br_tags   = Input(Vec(plWidth, Valid(UInt(brTagSz.W))))
+
+    // Mispredict info for recovering speculatively allocated registers.
+    val brupdate        = Input(new BrUpdateInfo)
+
+    val debug = new Bundle {
+      val pipeline_empty = Input(Bool())
+      val freelist = Output(Bits(numPregs.W))
+      val isprlist = Output(Bits(numPregs.W))
+    }
+  })
+```
+
+首先明白free list什么时候分配寄存器，什么时候写入用完的寄存器（分别是重命名阶段，和提交阶段），然后就明白上面信号什么意思了
+
+```
+  // The free list register array and its branch allocation lists.
+  val free_list = RegInit(UInt(numPregs.W), ~(1.U(numPregs.W)))
+  val br_alloc_lists = Reg(Vec(maxBrCount, UInt(numPregs.W)))
+
+  // Select pregs from the free list.
+  val sels = SelectFirstN(free_list, plWidth)
+  val sel_fire  = Wire(Vec(plWidth, Bool()))
+
+  // Allocations seen by branches in each pipeline slot.
+  val allocs = io.alloc_pregs map (a => UIntToOH(a.bits))
+  val alloc_masks = (allocs zip io.reqs).scanRight(0.U(n.W)) { case ((a,r),m) => m | a & Fill(n,r) }
+
+  // Masks that modify the freelist array.
+  val sel_mask = (sels zip sel_fire) map { case (s,f) => s & Fill(n,f) } reduce(_|_)
+  val br_deallocs = br_alloc_lists(io.brupdate.b2.uop.br_tag) & Fill(n, io.brupdate.b2.mispredict)
+  val dealloc_mask = io.dealloc_pregs.map(d => UIntToOH(d.bits)(numPregs-1,0) & Fill(n,d.valid)).reduce(_|_) | br_deallocs
+
+  val br_slots = VecInit(io.ren_br_tags.map(tag => tag.valid)).asUInt
+```
+
+然后free_list是一个size为物理寄存器个数的寄存器，介绍sels之前先介绍PriorityEncoderOH，这个就是返回第一个为true的oh编码，然后sel是就是找到4个为true的索引，并且为oh编码，然后就是sel_mask,这个就是将sels得到的oh组合起来，dealloc_mask就是从ROB返回的物理寄存器，把他转换为onehot，（这里不管分支预测的snapshot），
+
+```
+object PriorityEncoderOH {
+  private def encode(in: Seq[Bool]): UInt = {
+    val outs = Seq.tabulate(in.size)(i => (BigInt(1) << i).asUInt(in.size.W))
+    PriorityMux(in :+ true.B, outs :+ 0.U(in.size.W))
+  }
+  def apply(in: Seq[Bool]): Seq[Bool] = {
+    val enc = encode(in)
+    Seq.tabulate(in.size)(enc(_))
+  }
+  def apply(in: Bits): UInt = encode((0 until in.getWidth).map(i => in(i)))
+}
+```
+
+然后freelist更新，之后就是读出分配好的寄存器
+
+```
+  // Update the free list.
+  free_list := (free_list & ~sel_mask | dealloc_mask) & ~(1.U(numPregs.W))
+
+  // Pipeline logic | hookup outputs.
+  for (w <- 0 until plWidth) {
+    val can_sel = sels(w).orR
+    val r_valid = RegInit(false.B)
+    val r_sel   = RegEnable(OHToUInt(sels(w)), sel_fire(w))
+
+    r_valid := r_valid && !io.reqs(w) || can_sel
+    sel_fire(w) := (!r_valid || io.reqs(w)) && can_sel
+
+    io.alloc_pregs(w).bits  := r_sel
+    io.alloc_pregs(w).valid := r_valid
+  }
+```
+
+## RenameStage
+
+直接看链接[重命名](https://zhuanlan.zhihu.com/p/399543947)
+
+其实有个问题：maptable本身支持解决RAW，但在rename模块将bypass给关闭了，然后在rename注册了BypassAllocations检查RAW相关，
+
+还有：
+
+rename有两级；第一级主要进行读RAT，第二阶段写RAT，读freelist，写busytable（链接认为第一阶段还有读freelsit，但代码内使用的却是ren2_uops，也就是第二级）
+
+下面简单讲一条指令在这个模块进行了什么操作：
+
+### 读RAT请求和写RAT
+
+```
+  for ((((ren1,ren2),com),w) <- (ren1_uops zip ren2_uops zip io.com_uops.reverse).zipWithIndex) {
+    map_reqs(w).lrs1 := ren1.lrs1
+    map_reqs(w).lrs2 := ren1.lrs2
+    map_reqs(w).lrs3 := ren1.lrs3
+    map_reqs(w).ldst := ren1.ldst
+
+    remap_reqs(w).ldst := Mux(io.rollback, com.ldst      , ren2.ldst)
+    remap_reqs(w).pdst := Mux(io.rollback, com.stale_pdst, ren2.pdst)
+  }
+```
+
+注意这里map_reqs是ren1传入，也就是从decode传入的，然后写入RAT就是ren2的逻辑和物理寄存器
+
+### 读freelist
+
+```
+  // Freelist inputs.
+  freelist.io.reqs := ren2_alloc_reqs
+  freelist.io.dealloc_pregs zip com_valids zip rbk_valids map
+    {case ((d,c),r) => d.valid := c || r}
+  freelist.io.dealloc_pregs zip io.com_uops map
+    {case (d,c) => d.bits := Mux(io.rollback, c.pdst, c.stale_pdst)}
+  freelist.io.ren_br_tags := ren2_br_tags
+  freelist.io.brupdate := io.brupdate
+  freelist.io.debug.pipeline_empty := io.debug_rob_empty
+
+  assert (ren2_alloc_reqs zip freelist.io.alloc_pregs map {case (r,p) => !r || p.bits =/= 0.U} reduce (_&&_),
+           "[rename-stage] A uop is trying to allocate the zero physical register.")
+
+  // Freelist outputs.
+  for ((uop, w) <- ren2_uops.zipWithIndex) {
+    val preg = freelist.io.alloc_pregs(w).bits
+    uop.pdst := Mux(uop.ldst =/= 0.U || float.B, preg, 0.U)
+  }
+```
+
+可以看到我们请求的前缀为ren2
+
+### 读busytable
+
+```
+  busytable.io.ren_uops := ren2_uops  // expects pdst to be set up.
+  busytable.io.rebusy_reqs := ren2_alloc_reqs
+  busytable.io.wb_valids := io.wakeups.map(_.valid)
+  busytable.io.wb_pdsts := io.wakeups.map(_.bits.uop.pdst)
+
+  assert (!(io.wakeups.map(x => x.valid && x.bits.uop.dst_rtype =/= rtype).reduce(_||_)),
+   "[rename] Wakeup has wrong rtype.")
+
+  for ((uop, w) <- ren2_uops.zipWithIndex) {
+    val busy = busytable.io.busy_resps(w)
+
+    uop.prs1_busy := uop.lrs1_rtype === rtype && busy.prs1_busy
+    uop.prs2_busy := uop.lrs2_rtype === rtype && busy.prs2_busy
+    uop.prs3_busy := uop.frs3_en && busy.prs3_busy
+
+    val valid = ren2_valids(w)
+    assert (!(valid && busy.prs1_busy && rtype === RT_FIX && uop.lrs1 === 0.U), "[rename] x0 is busy??")
+    assert (!(valid && busy.prs2_busy && rtype === RT_FIX && uop.lrs2 === 0.U), "[rename] x0 is busy??")
+  }
+```
+
+同样是在阶段2进行
+
+### 输出结果
+
+```
+  for (w <- 0 until plWidth) {
+    val can_allocate = freelist.io.alloc_pregs(w).valid
+
+    // Push back against Decode stage if Rename1 can't proceed.
+    io.ren_stalls(w) := (ren2_uops(w).dst_rtype === rtype) && !can_allocate
+
+    val bypassed_uop = Wire(new MicroOp)
+    if (w > 0) bypassed_uop := BypassAllocations(ren2_uops(w), ren2_uops.slice(0,w), ren2_alloc_reqs.slice(0,w))
+    else       bypassed_uop := ren2_uops(w)
+
+    io.ren2_uops(w) := GetNewUopAndBrMask(bypassed_uop, io.brupdate)
+  }
+```
+
+注意这里检测了一个指令包内的RAW，那我们还有WAW，但其实已经解决了，maptable的scanleft会写入最新的映射关系
