@@ -1551,7 +1551,7 @@ object PriorityEncoderOH {
 }
 ```
 
-然后freelist更新，之后就是读出分配好的寄存器
+然后freelist更新，之后就是读出分配好的寄存器,这里有个sel_fire,注意这里的逻辑有些混乱,
 
 ```
   // Update the free list.
@@ -1579,7 +1579,15 @@ object PriorityEncoderOH {
 
 还有：
 
-rename有两级；第一级主要进行读RAT，第二阶段写RAT，读freelist，写busytable（链接认为第一阶段还有读freelsit，但代码内使用的却是ren2_uops，也就是第二级）
+rename有两级；第一级主要进行读RAT，第二阶段写RAT，读出freelist，写busytable（链接认为第一阶段还有读freelsit，但代码内使用的却是ren2_uops，也就是第二级）
+
+其实感觉这里是一个比较逆天的操作,只看黄色框内容,由于r_sel是一个寄存器,在en后下个周期才可以得出新的值,这里虽然en(s2送入的请求)了,但实际上下个周期才会响应这个en,这里读出的还是之前的旧数据,但注意,这个旧寄存器值同样也是空闲的,因为他是由上一条指令读的,且freelist已经标记这个寄存器被分配出去了,非常逆天的操作,使用上个指令请求,然后这条指令正好读出,然后s2阶段就可以进行RAW检查了,这个操作完全可以在s1阶段产生请求,然后s2读出数据,还有下面这行代码,这个得结合流水线看,我们重命名一部分在decode/rename,另一部分在rename/dispatch,s1阶段主要进行读物理源寄存器(RAT),s2阶段读物理目的寄存器,然后把新的映射关系写入RAT,**所以我们不仅要处理组内相关性,还要处理组间相关性**,这句就是处理组间相关性,因为假设B指令的源寄存器和A指令的目的寄存器一样(一周期rename一条,B是新指令),B指令在s1读出的物理源寄存器可能不是最新的映射关系(A指令还没写入RAT),所以需要这行
+
+```
+    r_uop := GetNewUopAndBrMask(BypassAllocations(next_uop, ren2_uops, ren2_alloc_reqs), io.brupdate)
+```
+
+![1731584801027](image/diplomacy&boom/1731584801027.png)
 
 下面简单讲一条指令在这个模块进行了什么操作：
 
@@ -1668,3 +1676,7 @@ rename有两级；第一级主要进行读RAT，第二阶段写RAT，读freelist
 ```
 
 注意这里检测了一个指令包内的RAW，那我们还有WAW，但其实已经解决了，maptable的scanleft会写入最新的映射关系
+
+## 总结
+
+这里boom用了很多花活，巧妙但晦涩难懂，也体现了chisel的强大之处，本篇解读将分支预测失败的全部略过
