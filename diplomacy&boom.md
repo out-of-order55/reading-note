@@ -534,7 +534,7 @@ reduce:将元组的每个元素做相应操作,具有累积性
 
 最后DecodeLogic实现的就是将输入的addr的每部分解码,然后得到解码的信号
 
-# Rocketchip PMA（Physical Memory Attribute）
+# PMA（Physical Memory Attribute）
 
 PMA是一个SOC系统的固有属性,所以直接将其设为硬件实现,PMA是软件可读的,
 
@@ -1227,12 +1227,440 @@ n=3,k=2,sels就为(0010,0100),in_readys的意思就是可以传入数据了,也�
 
 # BOOM ROB
 
+* [ ] 由于ROB有很多信号目前是从执行级传来，导致解析可能有误，之后会更新解析
+
 ![1731673694620](image/diplomacy&boom/1731673694620.png)
 
 首先先理清,ROB在Dispatch写入指令信息,在提交阶段读出信息,提交总是最旧的指令,这里ROB是W个存储体(W=dispatch长度),每次写入ROB就是一个W宽度的指令信息,ROB仅存储一个指令包的首地址,bank(0)(指令包地址连续),但遇到分支指令就得产生气泡,重新开一行,不然无法读到正确的PC,**运行图就是下图,注意0x0008有问题,跳转地址为0x0028**
 
 ![1731675223257](image/diplomacy&boom/1731675223257.png)
 
+## ROB状态机
+
+ROB状态机有四个状态，这种情况是不含CRAT，也就是checkpoint，然后还有含有CRAT，这时候就会少一个s_rollback
+
+![1731739470401](image/diplomacy&boom/1731739470401.png)
+
+
+**is_unique** 信号是定义在 MicroOp 中的一个成员，表示只允许该指令一条指令存在于流水线中，流水线要对 is_unique 的指令做出的响应包括：
+
+* 等待 STQ (Store Queue) 中的指令全部提交
+* 清空该指令之后的取到的指令
+* ROB 标记为 unready，等待清空
+
+RISCV 指令集中 is_unique 有效的指令主要包括：
+
+* CSR(Control and Status Register) 指令
+* 原子指令
+* 内存屏障指令
+* 休眠指令
+* 机器模式特权指令
+
+下面是状态机代码
+
+```
+  // ROB FSM
+  if (!enableCommitMapTable) {
+    switch (rob_state) {
+      is (s_reset) {
+        rob_state := s_normal
+      }
+      is (s_normal) {
+        // Delay rollback 2 cycles so branch mispredictions can drain
+        when (RegNext(RegNext(exception_thrown))) {
+          rob_state := s_rollback
+        } .otherwise {
+          for (w <- 0 until coreWidth) {
+            when (io.enq_valids(w) && io.enq_uops(w).is_unique) {
+              rob_state := s_wait_till_empty
+            }
+          }
+        }
+      }
+      is (s_rollback) {
+        when (empty) {
+          rob_state := s_normal
+        }
+      }
+      is (s_wait_till_empty) {
+        when (RegNext(exception_thrown)) {
+          rob_state := s_rollback
+        } .elsewhen (empty) {
+          rob_state := s_normal
+        }
+      }
+    }
+  } else {
+    switch (rob_state) {
+      is (s_reset) {
+        rob_state := s_normal
+      }
+      is (s_normal) {
+        when (exception_thrown) {
+          ; //rob_state := s_rollback
+        } .otherwise {
+          for (w <- 0 until coreWidth) {
+            when (io.enq_valids(w) && io.enq_uops(w).is_unique) {
+              rob_state := s_wait_till_empty
+            }
+          }
+        }
+      }
+      is (s_rollback) {
+        when (rob_tail_idx  === rob_head_idx) {
+          rob_state := s_normal
+        }
+      }
+      is (s_wait_till_empty) {
+        when (exception_thrown) {
+          ; //rob_state := s_rollback
+        } .elsewhen (rob_tail === rob_head) {
+          rob_state := s_normal
+        }
+      }
+    }
+  }
+```
+
+## ROB输入
+
+输入就是在dispatch入队
+
+BOOM 为每个bank中的所有指令定义了若干变量记录重命名缓存的状态信息，主要包括：
+
+* rob_val         ：当前 bank 中每行指令的有效信号，初始化为0
+* rob_bsy        ：当前 bank 中每行指令的 busy 信号，busy=1时表示指令还在流水线中，当入队的指令不是fence或者fence.i都为busy，fence是保证内存顺序，不执行任何操作，故不busy
+* rob_unsafe   ：当前 bank 中每行指令的 unsafe 信号，指令 safe 表示一定可以被提交
+* rob_uop       ：当前 bank 中的每行指令
+
+其中unsafe有四种情况：
+
+* 使用LD队列
+* 使用ST队列，并且不是fence指令
+* 是分支或者jalr
+
+```
+def unsafe           = uses_ldq || (uses_stq && !is_fence) || is_br || is_jalr
+```
+
+当输入的指令有效时，就把相关信息写入ROB的tail位置
+
+```
+    when (io.enq_valids(w)) {
+      rob_val(rob_tail)       := true.B
+      rob_bsy(rob_tail)       := !(io.enq_uops(w).is_fence ||
+                                   io.enq_uops(w).is_fencei)
+      rob_unsafe(rob_tail)    := io.enq_uops(w).unsafe
+      rob_uop(rob_tail)       := io.enq_uops(w)
+      rob_exception(rob_tail) := io.enq_uops(w).exception
+      rob_predicated(rob_tail)   := false.B
+      rob_fflags(rob_tail)    := 0.U
+
+      assert (rob_val(rob_tail) === false.B, "[rob] overwriting a valid entry.")
+      assert ((io.enq_uops(w).rob_idx >> log2Ceil(coreWidth)) === rob_tail)
+    } .elsewhen (io.enq_valids.reduce(_|_) && !rob_val(rob_tail)) {
+      rob_uop(rob_tail).debug_inst := BUBBLE // just for debug purposes
+    }
+
+```
+
+## 写回级操作
+
+这个就是响应写回级操作，当写回有效，并且匹配到相关的bank，将busy和unsafe置为低，然后rob的pred设置为写回的pred，
+
+```
+    for (i <- 0 until numWakeupPorts) {
+      val wb_resp = io.wb_resps(i)
+      val wb_uop = wb_resp.bits.uop
+      val row_idx = GetRowIdx(wb_uop.rob_idx)
+      when (wb_resp.valid && MatchBank(GetBankIdx(wb_uop.rob_idx))) {
+        rob_bsy(row_idx)      := false.B
+        rob_unsafe(row_idx)   := false.B
+        rob_predicated(row_idx)  := wb_resp.bits.predicated
+      }
+    }
+```
+
+## 响应LSU输入
+
+> 注意：这里引用的[ROB](https://www.zhihu.com/search?type=content&q=boom%20ROB)，目前我还不太清楚LSU操作，故先引用，之后可能会加入自己理解
+
+* lsu_clr_bsy       ：当要 LSU 模块正确接受了要保存的数据时，清除 store 命令的 busy 状态，同时将指令标记为 safe。clr_bsy 信号的值与存储目标地址是否有效、TLB是否命中、是否处于错误的分支预测下、该指令在存储队列中的状态等因素有关。
+* lsu_clr_unsafe   ：推测 load 命令除了 Memory Ordering Failure 之外不会出现其他异常时，将 load 指令标记为 safe。lsu_clr_unsafe 信号要等广播异常之后才能输出，采用 RegNext 类型寄存器来延迟一个时钟周期。
+* lxcpt                  ：来自LSU的异常，包括异常的指令、异常是否有效、异常原因等信息。异常的指令在 rob_exception 中对应的值将置为1。
+
+```
+    for (clr_rob_idx <- io.lsu_clr_bsy) {
+      when (clr_rob_idx.valid && MatchBank(GetBankIdx(clr_rob_idx.bits))) {
+        val cidx = GetRowIdx(clr_rob_idx.bits)
+        rob_bsy(cidx)    := false.B
+        rob_unsafe(cidx) := false.B
+        assert (rob_val(cidx) === true.B, "[rob] store writing back to invalid entry.")
+        assert (rob_bsy(cidx) === true.B, "[rob] store writing back to a not-busy entry.")
+      }
+    }
+    for (clr <- io.lsu_clr_unsafe) {
+      when (clr.valid && MatchBank(GetBankIdx(clr.bits))) {
+        val cidx = GetRowIdx(clr.bits)
+        rob_unsafe(cidx) := false.B
+      }
+    }
+    when (io.lxcpt.valid && MatchBank(GetBankIdx(io.lxcpt.bits.uop.rob_idx))) {
+      rob_exception(GetRowIdx(io.lxcpt.bits.uop.rob_idx)) := true.B
+      when (io.lxcpt.bits.cause =/= MINI_EXCEPTION_MEM_ORDERING) {
+        // In the case of a mem-ordering failure, the failing load will have been marked safe already.
+        assert(rob_unsafe(GetRowIdx(io.lxcpt.bits.uop.rob_idx)),
+          "An instruction marked as safe is causing an exception")
+      }
+    }
+    can_throw_exception(w) := rob_val(rob_head) && rob_exception(rob_head)
+```
+
+
+
+**store** 命令特殊之处在于不需要写回 (Write Back) 寄存器，因此 LSU 模块将 store 指令从存储队列提交后，store 命令就可以从流水线中退休，即 io.lsu_clr_bsy 信号将 store 指令置为 safe 时同时置为 unbusy。
+
+**MINI_EXCEPTION_MEM_ORDERING** 是指发生存储-加载顺序异常(Memory Ordering Failure)。当 store 指令与其后的 load 指令有共同的目标地址时，类似 RAW 冲突，若 load 指令在 store 之前发射(Issue)，load 命令将从内存中读取错误的值。处理器在提交 store 指令时需要检查是否发生了 Memory Ordering Failure，如果有，则需要刷新流水线、修改重命名映射表等。Memory Ordering Failure 是处理器乱序执行带来的问题,是处理器设计的缺陷，不属于 RISCV 规定的异常，采用 MINI_EXCEPTION_MEM_ORSERING 来弥补。
+
+```scala
+can_throw_exception(w) := rob_val(rob_head) && rob_exception(rob_head)
+```
+
+当位于 ROB头(head) 的指令有效且异常时，才允许抛出异常。
+
+## 响应提交
+
+在 ROB 头的指令有效且已不在流水线中且未收到来自 CSR 的暂停信号（例如wfi指令）时有效，表示此时在 ROB 头的指令可以提交。
+
+```
+can_commit(w) := rob_val(rob_head) && !(rob_bsy(rob_head)) && !io.csr_stall
+```
+
+提交和抛出异常只能在提交阶段
+
+**will_commit** 这一段代码的主要作用是为 head 指针指向的 ROB 行中的每一个 bank 生成 will_commit 信号，will_commit 信号指示下一时钟周期指令是否提交。will_commit 信号有效的条件是：
+
+* 该 bank 中的指令可以提交
+* 该 bank 中的指令不会抛出异常
+* ROB 的提交没有被封锁
+
+**block_commit**  block_commit=1 时，ROB 既不能提交指令，也不能抛出异常。对于每个bank，都有一个自己的 block_commit 信号，只要一个 bank 被封锁提交，其后的所有 bank 都将被封锁提交。block_commit 信号保证 ROB 只能顺序提交。若 ROB 处于 s_rollback 或 s_reset 状态，或在前两个时钟周期内抛出异常时，block_commit将被初始化为1,即该行所有指令的提交都被封锁。
+
+ **will_throw_exception** ： 表示下一时钟周期将要抛出异常，该信号初始化为0，使信号有效的条件包括：
+
+* 当前bank可以抛出异常
+* 没有封锁提交
+* 上一个bank没有要提交的指令
+
+
+```
+  var block_commit = (rob_state =/= s_normal) && (rob_state =/= s_wait_till_empty) || RegNext(exception_thrown) || RegNext(RegNext(exception_thrown))
+  var will_throw_exception = false.B
+  var block_xcpt   = false.B
+
+  for (w <- 0 until coreWidth) {
+    will_throw_exception = (can_throw_exception(w) && !block_commit && !block_xcpt) || will_throw_exception
+
+    will_commit(w)       := can_commit(w) && !can_throw_exception(w) && !block_commit
+    block_commit         = (rob_head_vals(w) &&
+                           (!can_commit(w) || can_throw_exception(w))) || block_commit
+    block_xcpt           = will_commit(w)
+  }
+```
+
+## 异常跟踪逻辑
+
+ROB接受的异常信息来自两个方面：
+
+* 前端发生的异常，输入端口为 io.enq_valid 和 io.enq_uops.exception
+* LSU发生的异常，输入端口为 io.lxcpt
+
+只存储最旧的异常，因为本来异常就冲刷流水线，之后的异常无意义，首先将dispatch异常原因写入enq_xcpts,
+
+然后就是r_xcpt_uop的更新逻辑,
+
+如果发生回滚，或者冲刷流水线，或者异常被抛出了，不更新，
+
+如果是lsu的异常，首先将uop更新为lsu的uop，然后检查这个是否是最旧的异常（IsOlder）或者是否有效，如果是最旧的异常，或者r_xcpt_val无效，就进入更新逻辑更新next_xcpt_uop（其实就是next_xcpt_uop），
+
+如果是dispatch的，且是最旧的指令，更新信息
+
+如果这个异常位于分支预测失败路径，直接把r_xcpt_val无效
+
+```
+  val next_xcpt_uop = Wire(new MicroOp())
+  next_xcpt_uop := r_xcpt_uop
+  val enq_xcpts = Wire(Vec(coreWidth, Bool()))
+  for (i <- 0 until coreWidth) {
+    enq_xcpts(i) := io.enq_valids(i) && io.enq_uops(i).exception
+  }
+
+  when (!(io.flush.valid || exception_thrown) && rob_state =/= s_rollback) {
+    when (io.lxcpt.valid) {
+      val new_xcpt_uop = io.lxcpt.bits.uop
+
+      when (!r_xcpt_val || IsOlder(new_xcpt_uop.rob_idx, r_xcpt_uop.rob_idx, rob_head_idx)) {
+        r_xcpt_val              := true.B
+        next_xcpt_uop           := new_xcpt_uop
+        next_xcpt_uop.exc_cause := io.lxcpt.bits.cause
+        r_xcpt_badvaddr         := io.lxcpt.bits.badvaddr
+      }
+    } .elsewhen (!r_xcpt_val && enq_xcpts.reduce(_|_)) {
+      val idx = enq_xcpts.indexWhere{i: Bool => i}
+
+      // if no exception yet, dispatch exception wins
+      r_xcpt_val      := true.B
+      next_xcpt_uop   := io.enq_uops(idx)
+      r_xcpt_badvaddr := AlignPCToBoundary(io.xcpt_fetch_pc, icBlockBytes) | io.enq_uops(idx).pc_lob
+
+    }
+  }
+
+  r_xcpt_uop         := next_xcpt_uop
+  r_xcpt_uop.br_mask := GetNewBrMask(io.brupdate, next_xcpt_uop)
+  when (io.flush.valid || IsKilledByBranch(io.brupdate, next_xcpt_uop)) {
+    r_xcpt_val := false.B
+  }
+```
+
+## 分支预测失败
+
+主要是消除mask一样的分支，否则就更新这个指令的br_mask，
+
+```
+    // -----------------------------------------------
+    // Kill speculated entries on branch mispredict
+    for (i <- 0 until numRobRows) {
+      val br_mask = rob_uop(i).br_mask
+
+      //kill instruction if mispredict & br mask match
+      when (IsKilledByBranch(io.brupdate, br_mask))
+      {
+        rob_val(i) := false.B
+        rob_uop(i.U).debug_inst := BUBBLE
+      } .elsewhen (rob_val(i)) {
+        // clear speculation bit even on correct speculation
+        rob_uop(i).br_mask := GetNewBrMask(io.brupdate, br_mask)
+      }
+    }
+```
+
+##  ROB Head Logic
+
+当一个bank的所有指令都可以提交，才可以改变head指针状态，finished_committing_row只有当commit指令有效，并且将在下个周期提交，并且head有效
+
+* [ ] 弄明白r_partial_row是什么意思
+
+这时就会自增ROB的head指针，否则将rob_head_lsb指向第一个为1的bank
+
+```
+  val rob_deq = WireInit(false.B)
+  val r_partial_row = RegInit(false.B)
+
+  when (io.enq_valids.reduce(_|_)) {
+    r_partial_row := io.enq_partial_stall
+  }
+
+  val finished_committing_row =
+    (io.commit.valids.asUInt =/= 0.U) &&
+    ((will_commit.asUInt ^ rob_head_vals.asUInt) === 0.U) &&
+    !(r_partial_row && rob_head === rob_tail && !maybe_full)
+
+  when (finished_committing_row) {
+    rob_head     := WrapInc(rob_head, numRobRows)
+    rob_head_lsb := 0.U
+    rob_deq      := true.B
+  } .otherwise {
+    rob_head_lsb := OHToUInt(PriorityEncoderOH(rob_head_vals.asUInt))
+  }
+```
+
+## ROB Tail Logic
+
+tail主要有以下优先级：
+
+1. 当处于回滚状态，并且还没操作完或者ROB满了，此时自减tail，设置deq为true，
+2. 当处于回滚，但tail等于head并且没有满，lsb设置为head的lsb
+
+* [X] lsb意思就是bank的偏移
+
+3. 当分支预测失败，自增
+4. 当dispatch，自增，然后指向第0个bank
+5. 当指令未派遣完，将LSB设置为最后一个有效指令的下一个bank
+
+```
+  val rob_enq = WireInit(false.B)
+
+  when (rob_state === s_rollback && (rob_tail =/= rob_head || maybe_full)) {
+    // Rollback a row
+    rob_tail     := WrapDec(rob_tail, numRobRows)
+    rob_tail_lsb := (coreWidth-1).U
+    rob_deq := true.B
+  } .elsewhen (rob_state === s_rollback && (rob_tail === rob_head) && !maybe_full) {
+    // Rollback an entry
+    rob_tail_lsb := rob_head_lsb
+  } .elsewhen (io.brupdate.b2.mispredict) {
+    rob_tail     := WrapInc(GetRowIdx(io.brupdate.b2.uop.rob_idx), numRobRows)
+    rob_tail_lsb := 0.U
+  } .elsewhen (io.enq_valids.asUInt =/= 0.U && !io.enq_partial_stall) {
+    rob_tail     := WrapInc(rob_tail, numRobRows)
+    rob_tail_lsb := 0.U
+    rob_enq      := true.B
+  } .elsewhen (io.enq_valids.asUInt =/= 0.U && io.enq_partial_stall) {
+    rob_tail_lsb := PriorityEncoder(~MaskLower(io.enq_valids.asUInt))
+  }
+```
+
+## ROB PNR逻辑
+
+1. [ ] TODO
+
+## ROB输出逻辑
+
+提交是否有效，以及回滚是否有效
+
+```
+    io.commit.valids(w) := will_commit(w)
+    io.commit.arch_valids(w) := will_commit(w) && !rob_predicated(com_idx)
+    io.commit.uops(w)   := rob_uop(com_idx)
+    io.commit.debug_insts(w) := rob_debug_inst_rdata(w)
+...
+    io.commit.rbk_valids(w) := rbk_row && rob_val(com_idx) && !(enableCommitMapTable.B)
+    io.commit.rollback := (rob_state === s_rollback)
+```
+
+送往前端的flush信号
+
+```
+  // delay a cycle for critical path considerations
+  io.flush.valid          := flush_val
+  io.flush.bits.ftq_idx   := flush_uop.ftq_idx
+  io.flush.bits.pc_lob    := flush_uop.pc_lob
+  io.flush.bits.edge_inst := flush_uop.edge_inst
+  io.flush.bits.is_rvc    := flush_uop.is_rvc
+  io.flush.bits.flush_typ := FlushTypes.getType(flush_val,
+                                                exception_thrown && !is_mini_exception,
+                                                flush_commit && flush_uop.uopc === uopERET,
+                                                refetch_inst)
+```
+
+输出异常信息，提交异常
+
+```
+  // Note: exception must be in the commit bundle.
+  // Note: exception must be the first valid instruction in the commit bundle.
+  exception_thrown := will_throw_exception
+  val is_mini_exception = io.com_xcpt.bits.cause === MINI_EXCEPTION_MEM_ORDERING
+  io.com_xcpt.valid := exception_thrown && !is_mini_exception
+  io.com_xcpt.bits.cause := r_xcpt_uop.exc_cause
+...
+  io.com_xcpt.bits.badvaddr := Sext(r_xcpt_badvaddr, xLen)
+...
+  io.com_xcpt.bits.ftq_idx   := com_xcpt_uop.ftq_idx
+  io.com_xcpt.bits.edge_inst := com_xcpt_uop.edge_inst
+  io.com_xcpt.bits.is_rvc    := com_xcpt_uop.is_rvc
+  io.com_xcpt.bits.pc_lob    := com_xcpt_uop.pc_lob
+```
 
 # BOOM V3 ISSUE 模块解析
 
