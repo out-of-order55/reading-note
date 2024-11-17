@@ -1241,7 +1241,6 @@ ROB状态机有四个状态，这种情况是不含CRAT，也就是checkpoint，
 
 ![1731739470401](image/diplomacy&boom/1731739470401.png)
 
-
 **is_unique** 信号是定义在 MicroOp 中的一个成员，表示只允许该指令一条指令存在于流水线中，流水线要对 is_unique 的指令做出的响应包括：
 
 * 等待 STQ (Store Queue) 中的指令全部提交
@@ -1416,8 +1415,6 @@ def unsafe           = uses_ldq || (uses_stq && !is_fence) || is_br || is_jalr
     can_throw_exception(w) := rob_val(rob_head) && rob_exception(rob_head)
 ```
 
-
-
 **store** 命令特殊之处在于不需要写回 (Write Back) 寄存器，因此 LSU 模块将 store 指令从存储队列提交后，store 命令就可以从流水线中退休，即 io.lsu_clr_bsy 信号将 store 指令置为 safe 时同时置为 unbusy。
 
 **MINI_EXCEPTION_MEM_ORDERING** 是指发生存储-加载顺序异常(Memory Ordering Failure)。当 store 指令与其后的 load 指令有共同的目标地址时，类似 RAW 冲突，若 load 指令在 store 之前发射(Issue)，load 命令将从内存中读取错误的值。处理器在提交 store 指令时需要检查是否发生了 Memory Ordering Failure，如果有，则需要刷新流水线、修改重命名映射表等。Memory Ordering Failure 是处理器乱序执行带来的问题,是处理器设计的缺陷，不属于 RISCV 规定的异常，采用 MINI_EXCEPTION_MEM_ORSERING 来弥补。
@@ -1451,7 +1448,6 @@ can_commit(w) := rob_val(rob_head) && !(rob_bsy(rob_head)) && !io.csr_stall
 * 当前bank可以抛出异常
 * 没有封锁提交
 * 上一个bank没有要提交的指令
-
 
 ```
   var block_commit = (rob_state =/= s_normal) && (rob_state =/= s_wait_till_empty) || RegNext(exception_thrown) || RegNext(RegNext(exception_thrown))
@@ -1545,7 +1541,7 @@ ROB接受的异常信息来自两个方面：
     }
 ```
 
-##  ROB Head Logic
+## ROB Head Logic
 
 当一个bank的所有指令都可以提交，才可以改变head指针状态，finished_committing_row只有当commit指令有效，并且将在下个周期提交，并且head有效
 
@@ -1632,7 +1628,7 @@ tail主要有以下优先级：
 送往前端的flush信号
 
 ```
-  // delay a cycle for critical path considerations
+   // delay a cycle for critical path considerations
   io.flush.valid          := flush_val
   io.flush.bits.ftq_idx   := flush_uop.ftq_idx
   io.flush.bits.pc_lob    := flush_uop.pc_lob
@@ -1660,6 +1656,13 @@ tail主要有以下优先级：
   io.com_xcpt.bits.edge_inst := com_xcpt_uop.edge_inst
   io.com_xcpt.bits.is_rvc    := com_xcpt_uop.is_rvc
   io.com_xcpt.bits.pc_lob    := com_xcpt_uop.pc_lob
+```
+
+送往ren2/dispatch的信号
+
+```
+  io.empty        := empty
+  io.ready        := (rob_state === s_normal) && !full && !r_xcpt_val
 ```
 
 # BOOM V3 ISSUE 模块解析
@@ -2223,3 +2226,337 @@ abstract class IssueUnit(
 ## 总结
 
 无论是压缩还是非压缩,issue都使用相同的slot,而且仲裁逻辑都是一样的,也就是从低slot扫描到高slot,直到凑齐发射指令
+
+# Boom regfile
+
+## Regfile模块
+
+### 读逻辑
+
+首先检查是否有bypass数据,如果有的话,就选择读出的数据是bypass数据,注意这里选择bypass数据时是选择最新写入这个寄存器的值,,也就是采用Mux1H,得到bypass数据,注意这里提交都是等一个ROB行算完才可以提交并bypass,如果无bypass数据,就直接读出regfile的数
+
+> 这里的bypass是指W->R bypass
+
+```
+  if (bypassableArray.reduce(_||_)) {
+    val bypassable_wports = ArrayBuffer[Valid[RegisterFileWritePort]]()
+    io.write_ports zip bypassableArray map { case (wport, b) => if (b) { bypassable_wports += wport} }
+
+    for (i <- 0 until numReadPorts) {
+      val bypass_ens = bypassable_wports.map(x => x.valid &&
+        x.bits.addr === read_addrs(i))
+      //使用Mux1H得出最新的指令的bypass的结果
+      val bypass_data = Mux1H(VecInit(bypass_ens.toSeq), VecInit(bypassable_wports.map(_.bits.data).toSeq))
+
+      io.read_ports(i).data := Mux(bypass_ens.reduce(_|_), bypass_data, read_data(i))
+    }
+  } else {
+    for (i <- 0 until numReadPorts) {
+      io.read_ports(i).data := read_data(i)
+    }
+  }
+```
+
+### 写逻辑
+
+代码如下.
+
+```
+  for (wport <- io.write_ports) {
+    when (wport.valid) {
+      regfile(wport.bits.addr) := wport.bits.data
+    }
+  }
+```
+
+## RegisterRead模块
+
+### 读端口逻辑
+
+首先读出issue模块送入的rs的addr，将其送入rf模块，然后根据addr读出相应数据，主要这里读寄存器在issue，读出寄存器在RF阶段，然后exe_reg_uops是送往exe阶段的uops，这里的idx的意思就是充分利用每个端口，端口不与指令绑定，比如我有两条指令，一个需要2个读，一个需要1个写，所以我的读idx在循环内为（0，2）
+
+* [ ] 暂时不知道为什么延迟的原因
+
+```
+  var idx = 0 // index into flattened read_ports array
+  for (w <- 0 until issueWidth) {
+    val numReadPorts = numReadPortsArray(w)
+
+    // NOTE:
+    // rrdLatency==1, we need to send read address at end of ISS stage,
+    //    in order to get read data back at end of RRD stage.
+
+    val rs1_addr = io.iss_uops(w).prs1
+    val rs2_addr = io.iss_uops(w).prs2
+    val rs3_addr = io.iss_uops(w).prs3
+    val pred_addr = io.iss_uops(w).ppred
+
+    if (numReadPorts > 0) io.rf_read_ports(idx+0).addr := rs1_addr
+    if (numReadPorts > 1) io.rf_read_ports(idx+1).addr := rs2_addr
+    if (numReadPorts > 2) io.rf_read_ports(idx+2).addr := rs3_addr
+
+    if (enableSFBOpt) io.prf_read_ports(w).addr := pred_addr
+
+    if (numReadPorts > 0) rrd_rs1_data(w) := Mux(RegNext(rs1_addr === 0.U), 0.U, io.rf_read_ports(idx+0).data)
+    if (numReadPorts > 1) rrd_rs2_data(w) := Mux(RegNext(rs2_addr === 0.U), 0.U, io.rf_read_ports(idx+1).data)
+    if (numReadPorts > 2) rrd_rs3_data(w) := Mux(RegNext(rs3_addr === 0.U), 0.U, io.rf_read_ports(idx+2).data)
+
+    if (enableSFBOpt) rrd_pred_data(w) := Mux(RegNext(io.iss_uops(w).is_sfb_shadow), io.prf_read_ports(w).data, false.B)
+
+    val rrd_kill = io.kill || IsKilledByBranch(io.brupdate, rrd_uops(w))
+
+    exe_reg_valids(w) := Mux(rrd_kill, false.B, rrd_valids(w))
+    // TODO use only the valids signal, don't require us to set nullUop
+    exe_reg_uops(w)   := Mux(rrd_kill, NullMicroOp, rrd_uops(w))
+
+    exe_reg_uops(w).br_mask := GetNewBrMask(io.brupdate, rrd_uops(w))
+
+    idx += numReadPorts
+  }
+```
+
+### BYPASS逻辑
+
+bypass不bypass寄存器rs3（FU），也就是只bypass INT，其中rs1_cases，rs2_cases得出了mux控制信号和data，然后MUXcase的意思就是默认为rrd_rs1_data，如果之后的条件满足，就选择之后的值
+
+```
+  for (w <- 0 until issueWidth) {
+    val numReadPorts = numReadPortsArray(w)
+    var rs1_cases = Array((false.B, 0.U(registerWidth.W)))
+    var rs2_cases = Array((false.B, 0.U(registerWidth.W)))
+    var pred_cases = Array((false.B, 0.U(1.W)))
+
+    val prs1       = rrd_uops(w).prs1
+    val lrs1_rtype = rrd_uops(w).lrs1_rtype
+    val prs2       = rrd_uops(w).prs2
+    val lrs2_rtype = rrd_uops(w).lrs2_rtype
+    val ppred      = rrd_uops(w).ppred
+
+    for (b <- 0 until numTotalBypassPorts)
+    {
+      val bypass = io.bypass(b)
+      // can't use "io.bypass.valid(b) since it would create a combinational loop on branch kills"
+      rs1_cases ++= Array((bypass.valid && (prs1 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs1_rtype === RT_FIX && (prs1 =/= 0.U), bypass.bits.data))
+      rs2_cases ++= Array((bypass.valid && (prs2 === bypass.bits.uop.pdst) && bypass.bits.uop.rf_wen
+        && bypass.bits.uop.dst_rtype === RT_FIX && lrs2_rtype === RT_FIX && (prs2 =/= 0.U), bypass.bits.data))
+    }
+
+    for (b <- 0 until numTotalPredBypassPorts)
+    {
+      val bypass = io.pred_bypass(b)
+      pred_cases ++= Array((bypass.valid && (ppred === bypass.bits.uop.pdst) && bypass.bits.uop.is_sfb_br, bypass.bits.data))
+    }
+
+    if (numReadPorts > 0) bypassed_rs1_data(w)  := MuxCase(rrd_rs1_data(w), rs1_cases)
+    if (numReadPorts > 1) bypassed_rs2_data(w)  := MuxCase(rrd_rs2_data(w), rs2_cases)
+    if (enableSFBOpt)     bypassed_pred_data(w) := MuxCase(rrd_pred_data(w), pred_cases)
+  }
+```
+
+### 送往执行阶段信号
+
+代码如下，主要送了valid，数据和uops，注意这里是有pipe reg的
+
+```
+  // set outputs to execute pipelines
+  for (w <- 0 until issueWidth) {
+    val numReadPorts = numReadPortsArray(w)
+
+    io.exe_reqs(w).valid    := exe_reg_valids(w)
+    io.exe_reqs(w).bits.uop := exe_reg_uops(w)
+    if (numReadPorts > 0) io.exe_reqs(w).bits.rs1_data := exe_reg_rs1_data(w)
+    if (numReadPorts > 1) io.exe_reqs(w).bits.rs2_data := exe_reg_rs2_data(w)
+    if (numReadPorts > 2) io.exe_reqs(w).bits.rs3_data := exe_reg_rs3_data(w)
+    if (enableSFBOpt)     io.exe_reqs(w).bits.pred_data := exe_reg_pred_data(w)
+  }
+```
+
+### 总结
+
+regfile和regfile_read均有bypass逻辑，但前者只bypassW->R ,后者bypass所有有效的FU的数据（不包括FPU）
+
+# BOOM EXU
+
+![1731814497133](image/diplomacy&boom/1731814497133.png)
+
+BOOM是非数据捕捉模式，可以看到alu模块插入了寄存器，这里是为了和mul与FPU匹配，简化写入端口调度
+
+## 执行单元
+
+![1731843369344](image/diplomacy&boom/1731843369344.png)
+
+这个例子是一个INT ALU，和乘法器，issue每个issue端口，只与一个FU对话，执行单元就是一个抽象单元，其包装的rocketchip的功能单元
+
+### PipelinedFunctionalUnit模块
+
+这是流水线功能单元的抽象类,主要补充下面ALU的模块
+
+#### Response 信号
+
+这里分了两种情况
+
+1. pipestage>0:这时候,输出有效信号就是r_valid的最高索引,r_valid每个周期都检测是否有kill信号,以及分支预测失败,
+
+```
+    io.resp.valid    := r_valids(numStages-1) && !IsKilledByBranch(io.brupdate, r_uops(numStages-1))
+    io.resp.bits.predicated := false.B
+    io.resp.bits.uop := r_uops(numStages-1)
+    io.resp.bits.uop.br_mask := GetNewBrMask(io.brupdate, r_uops(numStages-1))
+```
+
+2. pipestage==0,这时候,输出有效信号直接是输入的有效信号并且不能在失败路径上,
+
+```
+    io.resp.valid    := io.req.valid && !IsKilledByBranch(io.brupdate, io.req.bits.uop)
+    io.resp.bits.predicated := false.B
+    io.resp.bits.uop := io.req.bits.uop
+    io.resp.bits.uop.br_mask := GetNewBrMask(io.brupdate, io.req.bits.uop)
+```
+
+#### bypass 信号
+
+只有stage>0才有bypass,如果earliestBypassStage为0(表示第一个周期就可以bypass),那么第一个bypass的uops就是输入的uops,之后的的bypass_uops就是相对应的r_uops,
+
+> 注:这里bypass为i,但r_uops为i-1,主要就是r_uops为流水线寄存器,在下一个周期才可以获得数据
+
+* [ ] 暂时不知道第一句是干什莫的,似乎在earliestBypassStage不为0才有用,但目前都是为0的情况
+
+```
+      if (numBypassStages > 0) {
+        io.bypass(i-1).bits.uop := r_uops(i-1)
+      }
+...
+    if (numBypassStages > 0 && earliestBypassStage == 0) {
+      io.bypass(0).bits.uop := io.req.bits.uop
+
+      for (i <- 1 until numBypassStages) {
+        io.bypass(i).bits.uop := r_uops(i-1)
+      }
+    }
+```
+
+### ALU模块
+
+alu逻辑包含BR分支计算，以及正常指令计算
+
+#### 数据选择
+
+* op1的数据来源有两个地方，PC以及读出的rs1
+* op2的数据来源有四个来源，IMM，IMM_C（仅限于CSR指令），RS2,NEXT（也即是下一个pc的位移，2or4）
+
+#### 分支处理
+
+* BR_N：也就是PC+4
+* BR_NE:不相等
+* BR_EQ：相等
+* 。。。
+* BR_J:JUMP（jal）
+* BR_JR:JUMP REG（jalr）
+* PC_PLUS4：pc+4
+* PC_BRJMP：BR 目标地址
+* PC_BRJMP：jalr目标地址
+
+这里是检查送入的指令的类型是什么分支类型，根据控制信号该选什么样的target
+
+is_taken的意思是这个分支是否跳转，假如输入有效，没有在错误路径，是分支指令并且PC不为pc+4，就进行跳转
+
+```
+  val pc_sel = MuxLookup(uop.ctrl.br_type, PC_PLUS4,
+                 Seq(   BR_N   -> PC_PLUS4,
+                        BR_NE  -> Mux(!br_eq,  PC_BRJMP, PC_PLUS4),
+                        BR_EQ  -> Mux( br_eq,  PC_BRJMP, PC_PLUS4),
+                        BR_GE  -> Mux(!br_lt,  PC_BRJMP, PC_PLUS4),
+                        BR_GEU -> Mux(!br_ltu, PC_BRJMP, PC_PLUS4),
+                        BR_LT  -> Mux( br_lt,  PC_BRJMP, PC_PLUS4),
+                        BR_LTU -> Mux( br_ltu, PC_BRJMP, PC_PLUS4),
+                        BR_J   -> PC_BRJMP,
+                        BR_JR  -> PC_JALR
+                        ))
+  val is_taken = io.req.valid &&
+                   !killed &&
+                   (uop.is_br || uop.is_jalr || uop.is_jal) &&
+                   (pc_sel =/= PC_PLUS4)
+```
+
+#### 分支地址计算
+
+主要就是計算jalr的target,然后得出cfi_idx,访问前端FTQ,获得pc,next_val意思是下一条指令是否有效
+
+jalr指令的误预测逻辑:
+
+* 下一条指令无效
+* 下一条指令有效但pc不是实际计算的pc
+* 没有被预测跳转,(在cfi找不到或者找到了但是无效预测)
+
+br指令的分支预测目标地址为target,供重定向使用
+
+```
+    brinfo.jalr_target := jalr_target
+    val cfi_idx = ((uop.pc_lob ^ Mux(io.get_ftq_pc.entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U)))(log2Ceil(fetchWidth),1)
+
+    when (pc_sel === PC_JALR) {
+      mispredict := !io.get_ftq_pc.next_val ||
+                    (io.get_ftq_pc.next_pc =/= jalr_target) ||
+                    !io.get_ftq_pc.entry.cfi_idx.valid ||
+                    (io.get_ftq_pc.entry.cfi_idx.bits =/= cfi_idx)
+    }
+brinfo.target_offset := target_offset
+```
+
+#### 分支预测失败检测
+
+首先，jal不参与检查，因为jal是必然跳转，且地址固定，jalr和br进行地址检测
+
+如果pc_sel为PC_PLUS4，说明实际为不跳转，如果之前为taken，就说明地址预测失败
+
+如果pc_sel为PC_BRJMP,说明实际跳转，如果之前预测taken，则地址预测成功
+
+```
+  when (is_br || is_jalr) {
+    if (!isJmpUnit) {
+      assert (pc_sel =/= PC_JALR)
+    }
+    when (pc_sel === PC_PLUS4) {
+      mispredict := uop.taken
+    }
+    when (pc_sel === PC_BRJMP) {
+      mispredict := !uop.taken
+    }
+  }
+```
+
+#### Response逻辑
+
+ALU out有以下来源:
+
+* 如果是is_sfb_shadow,并且pred_data,如果是ldst_rs1需要rs1,则把rs1当作结果,否則就是rs2(这个和BOOM的SFB有关)
+* 如果为MOV指令,就选择rs2为输出,否则就是选择alu计算的结果
+
+然后就是流水线逻辑,在s1将数据送入流水线,时候根据numstage选择流水级,最后输出的数据就是r_data的最高索引
+
+```
+  r_val (0) := io.req.valid
+  r_data(0) := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
+  r_pred(0) := io.req.bits.uop.is_sfb_shadow && io.req.bits.pred_data
+  for (i <- 1 until numStages) {
+    r_val(i)  := r_val(i-1)
+    r_data(i) := r_data(i-1)
+    r_pred(i) := r_pred(i-1)
+  }
+  io.resp.bits.data := r_data(numStages-1)
+  io.resp.bits.predicated := r_pred(numStages-1)
+```
+
+#### Bypass逻辑
+
+将各阶段的输出进行bypass,注意这里是有延迟一个周期的,也就是计算出来下个周期再bypass,
+
+```
+  io.bypass(0).valid := io.req.valid
+  io.bypass(0).bits.data := Mux(io.req.bits.uop.is_sfb_br, pc_sel === PC_BRJMP, alu_out)
+  for (i <- 1 until numStages) {
+    io.bypass(i).valid := r_val(i-1)
+    io.bypass(i).bits.data := r_data(i-1)
+  }
+```
