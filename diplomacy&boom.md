@@ -742,6 +742,301 @@ PMP表项的优先级是静态的。与访问的任何字节匹配的编号最�
 
 如果没有实现基于页面的虚拟内存，内存访问将同步检查PMP设置，因此没有SFENCE.VMA是必需的。
 
+# BOOM IFU
+
+![1731995196160](image/diplomacy&boom/1731995196160.png)
+
+前端将从ICache读出的数据写入fetch buf，
+
+## BOOM Front end
+
+前端为5个阶段,f0产生pc,f1进行TLB转换,F2读出数据送入IMem,F3对指令预解码,检查分支预测,(f1,f2,f3每个阶段都可以产生重定向,),然后将指令送入Fetch buffer,将分支预测信息送入FTQ
+
+### F0
+
+这个阶段选择pc,并且向icache和bpd发送请求
+
+```
+  when (RegNext(reset.asBool) && !reset.asBool) {
+    s0_valid   := true.B
+    s0_vpc     := io_reset_vector
+    s0_ghist   := (0.U).asTypeOf(new GlobalHistory)
+    s0_tsrc    := BSRC_C
+  }
+
+  icache.io.req.valid     := s0_valid
+  icache.io.req.bits.addr := s0_vpc
+
+  bpd.io.f0_req.valid      := s0_valid
+  bpd.io.f0_req.bits.pc    := s0_vpc
+  bpd.io.f0_req.bits.ghist := s0_ghist
+```
+
+s0的信号来自于其他阶段,这个是f1阶段的信号,如果f1有效,并且没有tlb_miss,就把f1的预测结果送入f0,然后标记结果来自BSRC_1,也就是ubtb,然后把f1的ghist送入f0,
+
+```
+  when (s1_valid && !s1_tlb_miss) {
+    // Stop fetching on fault
+    s0_valid     := !(s1_tlb_resp.ae.inst || s1_tlb_resp.pf.inst)
+    s0_tsrc      := BSRC_1
+    s0_vpc       := f1_predicted_target
+    s0_ghist     := f1_predicted_ghist
+    s0_is_replay := false.B
+  }
+```
+
+f2阶段送入的信号分以下情况
+
+* 如果s2阶段有效,并且icache无回应,或者icache有回应但f3阶段没有准备好接受,此时需要进行重定向,重新发送指令请求,然后清除f1阶段,
+* 如果s2阶段有效且f3准备好接受:1. 如果f2阶段预测的和f1的pc一样,就更新f2阶段的ghist,表示预测正确,2.如果f2的预测结果和f1不一样,或者f1本身就是无效的,就清除f1阶段,并且将pc重定向为预测器的pc,将s0的预测结果设置为BSRC_2
+
+```
+  when ((s2_valid && !icache.io.resp.valid) ||
+        (s2_valid && icache.io.resp.valid && !f3_ready)) {
+    s0_valid := (!s2_tlb_resp.ae.inst && !s2_tlb_resp.pf.inst) || s2_is_replay || s2_tlb_miss
+    s0_vpc   := s2_vpc
+    s0_is_replay := s2_valid && icache.io.resp.valid
+    // When this is not a replay (it queried the BPDs, we should use f3 resp in the replaying s1)
+    s0_s1_use_f3_bpd_resp := !s2_is_replay
+    s0_ghist := s2_ghist
+    s0_tsrc  := s2_tsrc
+    f1_clear := true.B
+  } .elsewhen (s2_valid && f3_ready) {
+    when (s1_valid && s1_vpc === f2_predicted_target && !f2_correct_f1_ghist) {
+      // We trust our prediction of what the global history for the next branch should be
+      s2_ghist := f2_predicted_ghist
+    }
+    when ((s1_valid && (s1_vpc =/= f2_predicted_target || f2_correct_f1_ghist)) || !s1_valid) {
+      f1_clear := true.B
+
+      s0_valid     := !((s2_tlb_resp.ae.inst || s2_tlb_resp.pf.inst) && !s2_is_replay)
+      s0_vpc       := f2_predicted_target
+      s0_is_replay := false.B
+      s0_ghist     := f2_predicted_ghist
+      s2_fsrc      := BSRC_2
+      s0_tsrc      := BSRC_2
+    }
+  }
+  s0_replay_bpd_resp := f2_bpd_resp
+  s0_replay_resp := s2_tlb_resp
+  s0_replay_ppc  := s2_ppc
+```
+
+如果f3阶段的信号有效,f3重定向有以下情况
+
+* 如果f2阶段信号有效,但f2的pc不为f3的预测pc,或者f2的ghist和f3不一样
+* 如果f2阶段无效,f1阶段有效,但f1的pc不为f3的预测pc,或者f1的ghist和f3不一样
+* 如果f1,f2均无效
+
+此时,需要清除f2和f1阶段,然后将s0的pc设置为f3预测的pc
+
+```
+.elsewhen (( s2_valid &&  (s2_vpc =/= f3_predicted_target || f3_correct_f2_ghist)) ||
+          (!s2_valid &&  s1_valid && (s1_vpc =/= f3_predicted_target || f3_correct_f1_ghist)) ||
+          (!s2_valid && !s1_valid)) {
+      f2_clear := true.B
+      f1_clear := true.B
+
+      s0_valid     := !(f3_fetch_bundle.xcpt_pf_if || f3_fetch_bundle.xcpt_ae_if)
+      s0_vpc       := f3_predicted_target
+      s0_is_replay := false.B
+      s0_ghist     := f3_predicted_ghist
+      s0_tsrc      := BSRC_3
+
+      f3_fetch_bundle.fsrc := BSRC_3
+    }
+```
+
+最后就是后端传来信号
+
+* 如果执行了sfence,需要冲刷整个前端,将指令设置为sfence的pc
+* 如果后端发来重定向,冲刷整个前端,将pc设置为重定向pc
+
+```
+  when (io.cpu.sfence.valid) {
+    fb.io.clear := true.B
+    f4_clear    := true.B
+    f3_clear    := true.B
+    f2_clear    := true.B
+    f1_clear    := true.B
+
+    s0_valid     := false.B
+    s0_vpc       := io.cpu.sfence.bits.addr
+    s0_is_replay := false.B
+    s0_is_sfence := true.B
+
+  }.elsewhen (io.cpu.redirect_flush) {
+    fb.io.clear := true.B
+    f4_clear    := true.B
+    f3_clear    := true.B
+    f2_clear    := true.B
+    f1_clear    := true.B
+
+    f3_prev_is_half := false.B
+
+    s0_valid     := io.cpu.redirect_val
+    s0_vpc       := io.cpu.redirect_pc
+    s0_ghist     := io.cpu.redirect_ghist
+    s0_tsrc      := BSRC_C
+    s0_is_replay := false.B
+
+    ftq.io.redirect.valid := io.cpu.redirect_val
+    ftq.io.redirect.bits  := io.cpu.redirect_ftq_idx
+  }
+```
+
+**总结**
+
+pc重定向
+
+1、当执行SFENCE.VMA指令时，代表软件可能已经修改了页表，因此此时的TLB里的内容可能是错误的，那么此时正在流水线中执行的指令也有可能是错误的，因此需要刷新TLB和冲刷流水线，也需要重新进行地址翻译和取指，所以此时需要重定向PC值。
+
+2、当执行级发现分支预测失败、后续流水线发生异常或者发生Memory Ordering Failure时（Memory Ordering Failure的相关介绍见参考资料[1])，需要冲刷流水线，将处理器恢复到错误执行前的状态，指令也需要重新进行取指，所以此时也需要重定向PC值。
+
+3、当发生以下三种情况时，需要将PC重定向为F3阶段分支预测器预测的目标跳转地址：
+
+F2阶段的指令有效且F3阶段的分支预测结果与此时处于F2阶段的指令的PC值不相同；
+
+F2阶段的指令无效且F3阶段的分支预测结果与此时处于F1阶段的指令的PC值不相同；
+
+F2阶段和F1阶段的指令均无效。
+
+4、当Icache的响应无效或者F3阶段传来的握手信号没有准备就绪时，需要将PC值重定向为此时处于F2阶段的指令的PC值。
+
+5、当F1阶段的指令有效且F2阶段的分支预测结果与此时处于F1阶段的指令的PC值不相同或者F1阶段的指令无效时，需要将PC重定向为F2阶段分支预测器预测的目标跳转地址。
+
+6、当TLB没有发生miss且F1阶段的分支预测器预测结果为跳转时，需要将PC重定向为预测的目标跳转地址。
+
+## F1
+
+F1阶段进行tlb转换,并且得出ubtb结果,如果tlb miss需要终止icache访存
+
+### TLB访问逻辑
+
+如下面代码,s1_resp的结果来自两部分,如果s1有replay信号,那么结果就是replay的数据(只有f2才会发出replay表示指令准备好了但不能接受),否则就是tlb得出的数据
+
+> 个人感觉这里是降低功耗的一个小方法,如果f2replay,那么他的物理地址一定计算完了,我们就可以减少一次tlb访问
+
+```
+tlb.io.req.valid      := (s1_valid && !s1_is_replay && !f1_clear) || s1_is_sfence
+...
+  val s1_tlb_miss = !s1_is_replay && tlb.io.resp.miss
+  val s1_tlb_resp = Mux(s1_is_replay, RegNext(s0_replay_resp), tlb.io.resp)
+  val s1_ppc  = Mux(s1_is_replay, RegNext(s0_replay_ppc), tlb.io.resp.paddr)
+  val s1_bpd_resp = bpd.io.resp.f1
+
+  icache.io.s1_paddr := s1_ppc
+  icache.io.s1_kill  := tlb.io.resp.miss || f1_clear
+```
+
+### 分支信息处理逻辑
+
+f1阶段得出的分支预测结果可能有多个,我们取最旧的一个作为分支目标地址,然后更新ghist(GHR)
+
+> 如何选出最旧的分支呢？这里的做法是首先通过fetchMask得到一个指令包的有效指令位置，然后通过通过查询每个指令是否是分支指令并且taken，生成一个新的f1_redirects，然后通过优先编码器得到最旧指令的idx，之后从bpd的resp取出这个idx对应预测结果，如果确实有分支进行预测，就置target为预测的target，否则为pc+4（or 2）
+
+```
+  val f1_mask = fetchMask(s1_vpc)
+  val f1_redirects = (0 until fetchWidth) map { i =>
+    s1_valid && f1_mask(i) && s1_bpd_resp.preds(i).predicted_pc.valid &&
+    (s1_bpd_resp.preds(i).is_jal ||
+      (s1_bpd_resp.preds(i).is_br && s1_bpd_resp.preds(i).taken))
+  }
+  val f1_redirect_idx = PriorityEncoder(f1_redirects)
+  val f1_do_redirect = f1_redirects.reduce(_||_) && useBPD.B
+  val f1_targs = s1_bpd_resp.preds.map(_.predicted_pc.bits)
+  val f1_predicted_target = Mux(f1_do_redirect,
+                                f1_targs(f1_redirect_idx),
+                                nextFetch(s1_vpc))
+
+  val f1_predicted_ghist = s1_ghist.update(
+    s1_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f1_mask,
+    s1_bpd_resp.preds(f1_redirect_idx).taken && f1_do_redirect,
+    s1_bpd_resp.preds(f1_redirect_idx).is_br,
+    f1_redirect_idx,
+    f1_do_redirect,
+    s1_vpc,
+    false.B,
+    false.B)
+```
+
+#### 详解mask
+
+
+#### GHR更新逻辑
+
+## BOOM FTQ
+
+获取目标队列是一个队列，用于保存从 i-cache 接收到的 PC 以及与该地址关联的分支预测信息。它保存此信息，供管道在执行其[微操作 (UOP)](https://docs.boom-core.org/en/latest/sections/terminology.html#term-micro-op-uop)时参考。一旦提交指令，ROB 就会将其从队列中移出，并在管道重定向/误推测期间进行更新。
+
+## 入队
+
+当do_enq拉高，表示入队信号拉高，进入入队逻辑，new_entry和new_ghist接受入队数据，如现阶段有分支预测失败，就将入队glist写入new_list，否则，按照之前的数据更新new_list,然后写入ghist和lhist
+
+```
+  // This register lets us initialize the ghist to 0
+  val prev_ghist = RegInit((0.U).asTypeOf(new GlobalHistory))
+  val prev_entry = RegInit((0.U).asTypeOf(new FTQBundle))
+  val prev_pc    = RegInit(0.U(vaddrBitsExtended.W))
+  when (do_enq) {
+
+    pcs(enq_ptr)           := io.enq.bits.pc
+
+    val new_entry = Wire(new FTQBundle)
+
+    new_entry.cfi_idx   := io.enq.bits.cfi_idx
+    // Initially, if we see a CFI, it is assumed to be taken.
+    // Branch resolutions may change this
+    new_entry.cfi_taken     := io.enq.bits.cfi_idx.valid
+    new_entry.cfi_mispredicted := false.B
+    new_entry.cfi_type      := io.enq.bits.cfi_type
+    new_entry.cfi_is_call   := io.enq.bits.cfi_is_call
+    new_entry.cfi_is_ret    := io.enq.bits.cfi_is_ret
+    new_entry.cfi_npc_plus4 := io.enq.bits.cfi_npc_plus4
+    new_entry.ras_top       := io.enq.bits.ras_top
+    new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
+    new_entry.br_mask       := io.enq.bits.br_mask & io.enq.bits.mask
+    new_entry.start_bank    := bank(io.enq.bits.pc)
+
+    val new_ghist = Mux(io.enq.bits.ghist.current_saw_branch_not_taken,
+      io.enq.bits.ghist,
+      prev_ghist.update(
+        prev_entry.br_mask,
+        prev_entry.cfi_taken,
+        prev_entry.br_mask(prev_entry.cfi_idx.bits),
+        prev_entry.cfi_idx.bits,
+        prev_entry.cfi_idx.valid,
+        prev_pc,
+        prev_entry.cfi_is_call,
+        prev_entry.cfi_is_ret
+      )
+    )
+
+    lhist.map( l => l.write(enq_ptr, io.enq.bits.lhist))
+    ghist.map( g => g.write(enq_ptr, new_ghist))
+    meta.write(enq_ptr, io.enq.bits.bpd_meta)
+    ram(enq_ptr) := new_entry
+
+    prev_pc    := io.enq.bits.pc
+    prev_entry := new_entry
+    prev_ghist := new_ghist
+
+    enq_ptr := WrapInc(enq_ptr, num_entries)
+  }
+
+  io.enq_idx := enq_ptr
+```
+
+> cfi这些信号是干什么的?
+>
+> nbank参数是干什莫的:划分icache的bank数目,这个与interleaving有关
+>
+> bank(),求出这个地址属于哪个bank
+>
+> pc如何保存?
+>
+> mask位为1代表这个指令有效,br_mask位为1代表这个有效指令是br指令(条件跳转),
+
 # BOOM Decode
 
 首先就是IO,Decode模块的enq是传入的指令,deq是输出的指令,之后是CSR逻辑,和中断,BOOM模块主要就是复用lrocket的decodelogic模块,其他并无特色的地方
@@ -2559,4 +2854,44 @@ ALU out有以下来源:
     io.bypass(i).valid := r_val(i-1)
     io.bypass(i).bits.data := r_data(i-1)
   }
+```
+
+### 其他模块
+
+* MemAddrCalcUnit:完成地址计算以及store_data接受,同时进行misalign检查
+* DIV模块,是unpipe的,调用rocket模块
+* MUL模块,调用了rocket的模块
+
+## ALUExeUnit
+
+这个模块是各种单独FU的集合,目前允许,ALU和MUL和DIV在一块,但MEM只能单独一个ALUExeUnit,
+
+ALU Unit:这个模块包含BRU,他接受输入信号,然后只有ALU支持bypass
+
+### 输出逻辑
+
+输出信号主要有有效信号,数据,以及uops等,根据数据有效信号来得出数据
+
+```
+    io.iresp.valid     := iresp_fu_units.map(_.io.resp.valid).reduce(_|_)
+    io.iresp.bits.uop  := PriorityMux(iresp_fu_units.map(f =>
+      (f.io.resp.valid, f.io.resp.bits.uop)).toSeq)
+    io.iresp.bits.data := PriorityMux(iresp_fu_units.map(f =>
+      (f.io.resp.valid, f.io.resp.bits.data)).toSeq)
+    io.iresp.bits.predicated := PriorityMux(iresp_fu_units.map(f =>
+      (f.io.resp.valid, f.io.resp.bits.predicated)).toSeq)
+```
+
+## ExecutionUnits
+
+就是简单的连线模块
+
+> 为什么执行完直接写入寄存器，不会改变ARCH state吗?虽然写入寄存器，但仍然属于推测状态，这时，如果之前指令发生异常情况，这个指令的计算结果无效，从发生异常的指令重新执行，假如：r0之前的映射关系为（r0：p21），由于这里是统一PRF，只有改变了映射关系（提交阶段），状态才算改变，也就是虽然向p30写入数据了，但r0的映射关系目前还是p21，只有正确提交，r0的映射关系才会变为p30，如果下面指令之前有分支预测失败，假设我要是读取寄存器r0，那么还是p21的值，也就是最近正确写入的值
+
+```
+add r0，r1，r2
+add r0，r3，r0
+重命名后
+add p30，p11,p12
+add p31,p13,p30
 ```
