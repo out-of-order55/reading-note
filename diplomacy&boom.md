@@ -907,11 +907,11 @@ F2阶段和F1阶段的指令均无效。
 
 6、当TLB没有发生miss且F1阶段的分支预测器预测结果为跳转时，需要将PC重定向为预测的目标跳转地址。
 
-## F1
+### F1
 
 F1阶段进行tlb转换,并且得出ubtb结果,如果tlb miss需要终止icache访存
 
-### TLB访问逻辑
+#### TLB访问逻辑
 
 如下面代码,s1_resp的结果来自两部分,如果s1有replay信号,那么结果就是replay的数据(只有f2才会发出replay表示指令准备好了但不能接受),否则就是tlb得出的数据
 
@@ -929,7 +929,7 @@ tlb.io.req.valid      := (s1_valid && !s1_is_replay && !f1_clear) || s1_is_sfenc
   icache.io.s1_kill  := tlb.io.resp.miss || f1_clear
 ```
 
-### 分支信息处理逻辑
+#### 分支信息处理逻辑
 
 f1阶段得出的分支预测结果可能有多个,我们取最旧的一个作为分支目标地址,然后更新ghist(GHR)
 
@@ -962,12 +962,411 @@ f1阶段得出的分支预测结果可能有多个,我们取最旧的一个作�
 
 #### 详解mask
 
+取指令通过mask来屏蔽无效指令，如下面代码，我们只讲解bank=2的情况，首先算出shamt位移量，然后通过是否在同一个set算出end_mask,最后进行编码
 
-#### GHR更新逻辑
+举例：假设fetchWidth=8，coreInstBytes=2，block=16bytes，numChunks=2 banks=2
+
+如果地址为0011 1100，
+
+idx=110
+
+shamt=10
+
+那么这个地址显然需要跨两行，mayNotBeDualBanked显然为1，
+
+故end_mask = 0000 1111
+
+故最终结果为0000 1100，也就是他会屏蔽跨行的指令
+
+如果地址为0011 0100，这个没有跨行，所以最终结果为
+
+1111 1100
+
+也就是说，mask是对取出的指令做一个有效编码
+
+```
+  def isLastBankInBlock(addr: UInt) = {
+    (nBanks == 2).B && addr(blockOffBits-1, log2Ceil(bankBytes)) === (numChunks-1).U
+  }
+  def mayNotBeDualBanked(addr: UInt) = {
+    require(nBanks == 2)
+    isLastBankInBlock(addr)
+  }
+  def fetchMask(addr: UInt) = {
+    val idx = addr.extract(log2Ceil(fetchWidth)+log2Ceil(coreInstBytes)-1, log2Ceil(coreInstBytes))
+    if (nBanks == 1) {
+      ((1 << fetchWidth)-1).U << idx
+    } else {
+      val shamt = idx.extract(log2Ceil(fetchWidth)-2, 0)
+      val end_mask = Mux(mayNotBeDualBanked(addr), Fill(fetchWidth/2, 1.U), Fill(fetchWidth, 1.U))
+      ((1 << fetchWidth)-1).U << shamt & end_mask
+    }
+  }
+```
+
+那么br_mask 就是在有效指令中筛选为BR的指令
+
+#### GHist更新逻辑
+
+以例子来进行讲解
+
+Ghist的更新是采用了update方法,他的输入依次如下：
+
+* branches: UInt,：这个就是上面讲解的br_mask,
+* cfi_taken: Bool：指令是否taken，这个信号一般指的是最旧的指令是否taken，这个例子就是先得出f1_redirects(重定向指令的mask)，然后通过优先编码器得出最旧的指令然后得出是否要重定向信号f1_do_redirect，以及预测目标，所以这个信号就是最旧的分支是否taken，并且是否要重定向。
+* cfi_is_br: Bool：这个信号得出了最旧的分支指令是否为br，（f1分支预测包含br jalr，jalr，但只有条件分支可以更改ghist）
+* cfi_idx: UInt：得出最旧的分支指令的（这个可能包括jal或jalr，而且这个不是oh编码，只是简单的idx）
+* cfi_valid: Bool：是否需要重定向
+* addr: UInt：pc
+* cfi_is_call: Bool
+* cfi_is_ret: Bool
+
+```
+  val f1_mask = fetchMask(s1_vpc)
+  val f1_redirects = (0 until fetchWidth) map { i =>
+    s1_valid && f1_mask(i) && s1_bpd_resp.preds(i).predicted_pc.valid &&
+    (s1_bpd_resp.preds(i).is_jal ||
+      (s1_bpd_resp.preds(i).is_br && s1_bpd_resp.preds(i).taken))
+  }
+  val f1_redirect_idx = PriorityEncoder(f1_redirects)
+  val f1_do_redirect = f1_redirects.reduce(_||_) && useBPD.B
+  val f1_targs = s1_bpd_resp.preds.map(_.predicted_pc.bits)
+  val f1_predicted_target = Mux(f1_do_redirect,
+                                f1_targs(f1_redirect_idx),
+                                nextFetch(s1_vpc))
+  val f1_predicted_ghist = s1_ghist.update(
+    s1_bpd_resp.preds.map(p => p.is_br && p.predicted_pc.valid).asUInt & f1_mask,
+    s1_bpd_resp.preds(f1_redirect_idx).taken && f1_do_redirect,
+    s1_bpd_resp.preds(f1_redirect_idx).is_br,
+    f1_redirect_idx,
+    f1_do_redirect,
+    s1_vpc,
+    false.B,
+    false.B)
+```
+
+**not_taken_branches**：如果条件分支taken或者不是条件分支，这个就为0，否则就不为0，
+
+然后进入update方法，update方法也是分了bank讨论，首先讨论bank为1的
+
+new_history.old_history更新逻辑：
+
+* 如果这个分支是条件分支并且taken：histories(0) <<1|1.U
+* 如果是条件分支但没有taken：histories(0) <<1
+* 如果不是条件分支：histories(0)
+
+下面讨论bank为2的情况
+
+他使用的始终histories(1)，也就是更新逻辑,
+
+首先判断cfi指令在bank0或者整个packet是否跨行了（ignore_second_bank），然后得出第一个bank是否有条件分支未taken（first_bank_saw_not_taken）：
+
+如果忽视bank1，根据new_history.new_saw_branch_not_taken ，new_history.new_saw_branch_taken更新old_hist
+
+否则，new_saw_branch_not_taken：bank1是否有没taken的指令
+
+new_saw_branch_taken：bank1是否有taken的指令并且cfi不在bank0
+
+然后更新old_hist:
+
+> ~~感觉这个更新逻辑有问题，ignore_second_bank有两个条件：如果cfi在bank0，otherwise的MUX的cfi_is_br && cfi_in_bank_0必然不会成立，如果mayNotBeDualBanked成立，那么cfi必然在bank1，该条件仍然不会成立，同样first_bank_saw_not_taken也不会成立，所以这个逻辑最后就是得到了histories（1），之前的逻辑都是冗余的(将多余代码去掉仍然可以运行程序)~~
+>
+> 没什么问题,如果想进入otherwise代码块:
+>
+> 1. bank0无分支或者分支预测没taken
+> 2. 分支指令在bank1
+>
+> 但cfi_is_br && cfi_in_bank_0是无效的逻辑，进入when代码块必然不会进入otherwise，所以必然不会触发这个MUX条件（理解问题？）
+
+举个例子来说明这两个条件什么意思:
+
+例：假设fetchWidth=8，coreInstBytes=2，block=16bytes，numChunks=2 banks=2
+
+如果地址为0011 1100，cfi_idx_oh为0000 1000
+
+这个地址mayNotBeDualBanked为1，cfi_in_bank0为1,如果这个不是分支,或者没有taken,cfi_in_bank0为0
+
+如果地址0011 0000,cfi_idx_oh为0001 0000
+
+这个地址mayNotBeDualBanked为0，cfi_in_bank0为0,如果cfi_idx_oh,cfi_in_bank0就为1
+
+```
+  def histories(bank: Int) = {
+    if (nBanks == 1) {
+      old_history
+    } else {
+      require(nBanks == 2)
+      if (bank == 0) {
+        old_history
+      } else {
+        Mux(new_saw_branch_taken                            , old_history << 1 | 1.U,
+        Mux(new_saw_branch_not_taken                        , old_history << 1,
+                                                              old_history))
+      }
+    }
+  }  
+def update(branches: UInt, cfi_taken: Bool, cfi_is_br: Bool, cfi_idx: UInt,
+    cfi_valid: Bool, addr: UInt,
+    cfi_is_call: Bool, cfi_is_ret: Bool): GlobalHistory = {
+    val cfi_idx_fixed = cfi_idx(log2Ceil(fetchWidth)-1,0)
+    val cfi_idx_oh = UIntToOH(cfi_idx_fixed)
+    val new_history = Wire(new GlobalHistory)
+
+    val not_taken_branches = branches & Mux(cfi_valid,
+                                            MaskLower(cfi_idx_oh) & ~Mux(cfi_is_br && cfi_taken, cfi_idx_oh, 0.U(fetchWidth.W)),
+                                            ~(0.U(fetchWidth.W)))
+
+    if (nBanks == 1) {
+      // In the single bank case every bank sees the history including the previous bank
+      new_history := DontCare
+      new_history.current_saw_branch_not_taken := false.B
+      val saw_not_taken_branch = not_taken_branches =/= 0.U || current_saw_branch_not_taken
+      new_history.old_history := Mux(cfi_is_br && cfi_taken && cfi_valid   , histories(0) << 1 | 1.U,
+                                 Mux(saw_not_taken_branch                  , histories(0) << 1,
+                                                                             histories(0)))
+    } else {
+      // In the two bank case every bank ignore the history added by the previous bank
+      val base = histories(1)
+      val cfi_in_bank_0 = cfi_valid && cfi_taken && cfi_idx_fixed < bankWidth.U
+      val ignore_second_bank = cfi_in_bank_0 || mayNotBeDualBanked(addr)
+
+      val first_bank_saw_not_taken = not_taken_branches(bankWidth-1,0) =/= 0.U || current_saw_branch_not_taken
+      new_history.current_saw_branch_not_taken := false.B
+      when (ignore_second_bank) {
+        new_history.old_history := histories(1)
+        new_history.new_saw_branch_not_taken := first_bank_saw_not_taken
+        new_history.new_saw_branch_taken     := cfi_is_br && cfi_in_bank_0
+      } .otherwise {
+        new_history.old_history := Mux(cfi_is_br && cfi_in_bank_0                             , histories(1) << 1 | 1.U,
+                                   Mux(first_bank_saw_not_taken                               , histories(1) << 1,
+                                                                                                histories(1)))
+
+        new_history.new_saw_branch_not_taken := not_taken_branches(fetchWidth-1,bankWidth) =/= 0.U
+        new_history.new_saw_branch_taken     := cfi_valid && cfi_taken && cfi_is_br && !cfi_in_bank_0
+
+      }
+    }
+    new_history.ras_idx := Mux(cfi_valid && cfi_is_call, WrapInc(ras_idx, nRasEntries),
+                           Mux(cfi_valid && cfi_is_ret , WrapDec(ras_idx, nRasEntries), ras_idx))
+    new_history
+  }
+```
+
+### F2
+
+f2阶段获得cache数据，注意f2阶段可能收到无效的cache数据，或者收到了数据但f3接收不了，这时就要重定向，然后冲刷f1阶段，f2阶段也会得到预测结果，其处理和f1阶段类似
+
+> (s1_vpc =/= f2_predicted_target || f2_correct_f1_ghist)，f2分支预测重定向需要前面两个条件，条件1的意思就是f2阶段预测的地址和之前这条指令与目前f1的pc不一样，条件2的意思预测方向不一样
+
+### F3
+
+f3阶段使用了IMem Response Queue和BTB Response Queue，两个队列项数均为1，其中IMem Response Queue在F2阶段入队，在F3阶段出队，主要传递Icache响应的指令、PC、全局历史等信息；而BTB Response Queue则设置成“flow”的形式（即输入可以在同一周期内“流”过队列输出），所以它的入队出队均在F3阶段完成，主要传递分支预测器的预测信息。
+
+这个周期也会有来自bpd的预测信息（TAGE），同样会进行重定向，该阶段有一个快速译码单元用于检查分支预测，并且这个周期会检查RVC指令并进行相应处理
+
+#### 有效指令截断处理
+
+也就是32位的指令分布在两个指令包
+
+> 小插曲：f3_prev_is_half的值来自bank_prev_is_half，而bank_prev_is_half是一个var，也就是可变变量,这里他在for循环内多次被赋值，实际上就是给f3_prev_is_half提供了多个赋值条件
+>
+> ```
+> ...   
+>  bank_prev_is_half = Mux(f3_bank_mask(b),
+>       (!(bank_mask(bankWidth-2) && !isRVC(bank_insts(bankWidth-2))) && !isRVC(last_inst)),
+>       bank_prev_is_half)
+> ...
+>   when (f3.io.deq.fire) {
+>     f3_prev_is_half := bank_prev_is_half
+>     f3_prev_half    := bank_prev_half
+>     assert(f3_bpd_resp.io.deq.bits.pc === f3_fetch_bundle.pc)
+>   }
+> ```
+>
+> 下面是一个测试用例
+>
+> ![1732097110110](https://file+.vscode-resource.vscode-cdn.net/c%3A/Users/Legion/Desktop/arch_note/image/diplomacy&boom/1732097110110.png)
+>
+> ![1732097127143](https://file+.vscode-resource.vscode-cdn.net/c%3A/Users/Legion/Desktop/arch_note/image/diplomacy&boom/1732097127143.png)
+
+首先先解析bank信号，bank_data可以看到就是每个bank的data，对于largeboom就是64位的数据（其中bankwidth为4，bank为2）
+
+```
+    val bank_data  = f3_data((b+1)*bankWidth*16-1, b*bankWidth*16)
+    val bank_mask  = Wire(Vec(bankWidth, Bool()))
+    val bank_insts = Wire(Vec(bankWidth, UInt(32.W)))
+```
+
+bank_mask和之前提到的mask类似,揭示了一个bank每条指令是否有效,
+
+当f3的指令有效并且没有收到重定向信号,就对bank_mask赋值
+
+```
+  for (b <- 0 until nBanks) {
+.....
+
+    for (w <- 0 until bankWidth) {
+      val i = (b * bankWidth) + w
+      bank_mask(w) := f3.io.deq.valid && f3_imemresp.mask(i) && valid && !redirect_found
+```
+
+bank_inst主要逻辑在内层循环内
+
+主要有4种情况:
+
+1. 当w=0,也就是第一条指令,注意这条指令可能是不完整的32bit指令,如果这条指令是不完整,那么就将之前存的half指令拼接到这个不完整的指令,形成32bit(bank_data(15,0), f3_prev_half),注意如果此时b>0,也即是现在是bank1,那么之前的一半指令就是(bank_data(15,0), last_inst)拼接,如果这个指令是完整的指令,就直接为bank_data(31,0)
+2. 当w=1,bank_inst就直接为bank_data(47,16)
+3. 当w=bankWidth -1,注意这里可能会发生32bit的指令不完整的情况,bank_inst为16个0和bank_data(bankWidth*16-1,(bankWidth-1)*16)拼接
+4. 其他情况,bank_data(w*16+32-1,w*16)
+
+> 如下面的矩形,绿色代表4字节的指令,蓝色代表2字节的指令,四个块一个bank,其中情况1的b>0情况,第四个块就是last_inst,b=0的情况就是第一个块为4字节指令的后一半,前一半在f3_prev_half中存储,也就是之前的指令包的w=bankWidth -1,的指令
+
+![1732108893805](image/diplomacy&boom/1732108893805.png)
+
+```
+    for (w <- 0 until bankWidth) {
+...
+      val brsigs = Wire(new BranchDecodeSignals)
+      if (w == 0) {
+        val inst0 = Cat(bank_data(15,0), f3_prev_half)
+        val inst1 = bank_data(31,0)
+...
+
+        when (bank_prev_is_half) {
+          bank_insts(w)                := inst0
+...
+          if (b > 0) {
+            val inst0b     = Cat(bank_data(15,0), last_inst)
+...
+            when (f3_bank_mask(b-1)) {
+              bank_insts(w)                := inst0b
+              f3_fetch_bundle.insts(i)     := inst0b
+              f3_fetch_bundle.exp_insts(i) := exp_inst0b
+              brsigs                       := bpd_decoder0b.io.out
+            }
+          }
+        } .otherwise {
+          bank_insts(w)                := inst1
+...
+        }
+        valid := true.B
+      } else {
+        val inst = Wire(UInt(32.W))
+..
+        val pc = f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U
+...
+        bank_insts(w)                := inst
+...
+        if (w == 1) {
+          // Need special case since 0th instruction may carry over the wrap around
+          inst  := bank_data(47,16)
+          valid := bank_prev_is_half || !(bank_mask(0) && !isRVC(bank_insts(0)))
+        } else if (w == bankWidth - 1) {
+          inst  := Cat(0.U(16.W), bank_data(bankWidth*16-1,(bankWidth-1)*16))
+          valid := !((bank_mask(w-1) && !isRVC(bank_insts(w-1))) ||
+            !isRVC(inst))
+        } else {
+          inst  := bank_data(w*16+32-1,w*16)
+          valid := !(bank_mask(w-1) && !isRVC(bank_insts(w-1)))
+        }
+      }
+   last_inst = bank_insts(bankWidth-1)(15,0)
+   ...
+    }
+```
+
+OK,bank信号已经解释完了,接下来到RVC指令处理,首先RVC指令的低两位一定不是11,可以根据这个特性判断RVC
+
+#### 分支指令预解码
+
+ExpandRVC判断这个指令是否为RVC,如果为RVC,返回相应的扩展指令,如果不是RVC,直接返回输入的inst,inst0和1对应的是两种情况,一种是本指令包的第一条为32位指令,但有一半在上个指令包,另一种就是指令是整齐的
+
+> 如果这个指令对应两条RVC指令呢?
+>
+> RVC和RVI指令如何区分的呢
+>
+> f3_bank_mask信号有用吗
+
+```
+        val inst0 = Cat(bank_data(15,0), f3_prev_half)
+        val inst1 = bank_data(31,0)
+        val exp_inst0 = ExpandRVC(inst0)
+        val exp_inst1 = ExpandRVC(inst1)//inst0和1分别对应了RVI指令和未知的指令
+        val pc0 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U - 2.U)
+        val pc1 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U)
+
+```
+
+分支预解码也是分情况
+
+1. w=0,如果遇到了不完整的指令,就采用decoder0的结果,b>0,同样要做出处理,将inst0的f3_prev_half换为last_inst(其实这里bank_prev_half也可以),之后对这个指令解码就可以,否则就使用inst1的解码结果
+2. 其他情况,就直接对inst解码,注意inst的生成也会分情况(之前讲过)
+
+```
+ for (b <- 0 until nBanks) {
+...
+    for (w <- 0 until bankWidth) {
+...
+      val brsigs = Wire(new BranchDecodeSignals)
+      if (w == 0) {
+        val inst0 = Cat(bank_data(15,0), f3_prev_half)
+        val inst1 = bank_data(31,0)
+        val exp_inst0 = ExpandRVC(inst0)
+        val exp_inst1 = ExpandRVC(inst1)//inst0和1分别对应了RVI指令和未知的指令
+        val pc0 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U - 2.U)
+        val pc1 = (f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U)
+        val bpd_decoder0 = Module(new BranchDecode)
+        bpd_decoder0.io.inst := exp_inst0
+        bpd_decoder0.io.pc   := pc0
+        val bpd_decoder1 = Module(new BranchDecode)
+        bpd_decoder1.io.inst := exp_inst1
+        bpd_decoder1.io.pc   := pc1
+
+        when (bank_prev_is_half) {
+          bank_insts(w)                := inst0
+...
+          bpu.io.pc                    := pc0
+          brsigs                       := bpd_decoder0.io.out//指令不完整.且一定为32位,选择decode0的br信号
+...
+          if (b > 0) {
+            val inst0b     = Cat(bank_data(15,0), last_inst)
+            val exp_inst0b = ExpandRVC(inst0b)
+            val bpd_decoder0b = Module(new BranchDecode)
+            bpd_decoder0b.io.inst := exp_inst0b
+            bpd_decoder0b.io.pc   := pc0
+
+            when (f3_bank_mask(b-1)) {
+...
+              brsigs                       := bpd_decoder0b.io.out
+            }
+          }
+        } .otherwise {
+...
+          bpu.io.pc                    := pc1
+          brsigs                       := bpd_decoder1.io.out
+
+        }
+        valid := true.B
+      } else {
+        val inst = Wire(UInt(32.W))
+        val exp_inst = ExpandRVC(inst)
+        val pc = f3_aligned_pc + (i << log2Ceil(coreInstBytes)).U
+        val bpd_decoder = Module(new BranchDecode)
+        bpd_decoder.io.inst := exp_inst
+        bpd_decoder.io.pc   := pc
+...
+        bpu.io.pc                    := pc
+        brsigs                       := bpd_decoder.io.out
+...
+      }
+
+...
+  }
+```
 
 ## BOOM FTQ
 
-获取目标队列是一个队列，用于保存从 i-cache 接收到的 PC 以及与该地址关联的分支预测信息。它保存此信息，供管道在执行其[微操作 (UOP)](https://docs.boom-core.org/en/latest/sections/terminology.html#term-micro-op-uop)时参考。一旦提交指令，ROB 就会将其从队列中移出，并在管道重定向/误推测期间进行更新。
+获取目标队列是一个队列，用于保存从 i-cache 接收到的 PC 以及与该地址关联的分支预测信息。它保存此信息，供管道在执行其[微操作 (UOP)](https://docs.boom-core.org/en/latest/sections/terminology.html#term-micro-op-uop)时参考。一旦提交指令，ROB 就会将其从队列中移出，并在重定向/误推测期间进行更新。
 
 ## 入队
 
