@@ -746,7 +746,7 @@ PMP表项的优先级是静态的。与访问的任何字节匹配的编号最�
 
 ![1731995196160](image/diplomacy&boom/1731995196160.png)
 
-前端将从ICache读出的数据写入fetch buf，
+前端将从ICache读出的数据写入fetch buf
 
 ## BOOM Front end
 
@@ -1214,10 +1214,25 @@ bank_inst主要逻辑在内层循环内
 
 主要有4种情况:
 
-1. 当w=0,也就是第一条指令,注意这条指令可能是不完整的32bit指令,如果这条指令是不完整,那么就将之前存的half指令拼接到这个不完整的指令,形成32bit(bank_data(15,0), f3_prev_half),注意如果此时b>0,也即是现在是bank1,那么之前的一半指令就是(bank_data(15,0), last_inst)拼接,如果这个指令是完整的指令,就直接为bank_data(31,0)
-2. 当w=1,bank_inst就直接为bank_data(47,16)
-3. 当w=bankWidth -1,注意这里可能会发生32bit的指令不完整的情况,bank_inst为16个0和bank_data(bankWidth*16-1,(bankWidth-1)*16)拼接
+1. 当w=0,也就是第一条指令,注意这条指令可能是不完整的32bit指令,如果这条指令是不完整,那么就将之前存的half指令拼接到这个不完整的指令,形成32bit(bank_data(15,0), f3_prev_half),注意如果此时b>0,也即是现在是bank1,那么之前的一半指令就是(bank_data(15,0), last_inst)拼接,如果这个指令是完整的指令,就直接为bank_data(31,0),valid一定为true
+2. 当w=1,bank_inst就直接为bank_data(47,16),
+3. 当w=bankWidth -1,注意这里可能会发生32bit的指令不完整的情况,bank_inst为16个0和bank_data(bankWidth*16-1,(bankWidth-1)*16)拼接,
 4. 其他情况,bank_data(w*16+32-1,w*16)
+
+valid信号四种情况
+
+w=0,恒为高
+
+w=1,如果之前的指令为bank_prev_is_half,或者不满足括号条件(之前的指令有效但不是RVC指令),说明这个inst和之前的inst无关,valid拉高
+
+w=bankWidth -1,这里列举所有情况:
+
+1. 本条不是RVC,且上条也不是RVC:1.本条指令和上一条是一条指令,那么本条指令就无效,本条指令是下一个bank的前半部分指令,那么本条就为有效
+2. 本条不是RVC,但上一条是RVC:恒为高
+3. 本条是RVC,但上一条不是RVC,恒为高,因为上一条一定是32bit指令的后半部分,其bank_mask一定为低,!((bank_mask(w-1) &&!isRVC(bank_insts(w-1)))一定为高
+4. 本条是RVC,上条也是RVC:恒为高
+
+其他情况:只要上条指令不满足(bank_mask(w-1) &&!isRVC(bank_insts(w-1),就为高(上条指令无效,上条指令为32bit指令的后半部分或上条指令为RVC指令)
 
 > 如下面的矩形,绿色代表4字节的指令,蓝色代表2字节的指令,四个块一个bank,其中情况1的b>0情况,第四个块就是last_inst,b=0的情况就是第一个块为4字节指令的后一半,前一半在f3_prev_half中存储,也就是之前的指令包的w=bankWidth -1,的指令
 
@@ -1275,7 +1290,7 @@ bank_inst主要逻辑在内层循环内
     }
 ```
 
-OK,bank信号已经解释完了,接下来到RVC指令处理,首先RVC指令的低两位一定不是11,可以根据这个特性判断RVC
+OK,bank信号已经解释完了,接下来进行分支指令解码
 
 #### 分支指令预解码
 
@@ -1364,16 +1379,82 @@ ExpandRVC判断这个指令是否为RVC,如果为RVC,返回相应的扩展指令
   }
 ```
 
+f3阶段的目标来自多个地方(f3_targs):如果是jalr指令,那么目标地址只能为bpd预测的地址,如果是条件分支或者jal,目标地址就是解码出来的地址
+
+如果是jal指令:需要对目标地址检测,如果目标地址预测正确,不刷新BTB表项,
+
+如果进行重定向,那么先检测是不是ret指令.如果是,就从RAS取出数据,否则从f3_targs取数据,
+
+如果不重定向,就对pc+bankbyte或者fetchbyte
+
+```
+      f3_targs (i) := Mux(brsigs.cfi_type === CFI_JALR,
+        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits,
+        brsigs.target)
+
+      // Flush BTB entries for JALs if we mispredict the target
+      f3_btb_mispredicts(i) := (brsigs.cfi_type === CFI_JAL && valid &&
+        f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.valid &&
+        (f3_bpd_resp.io.deq.bits.preds(i).predicted_pc.bits =/= brsigs.target)
+      )
+
+
+      f3_npc_plus4_mask(i) := (if (w == 0) {
+        !f3_is_rvc(i) && !bank_prev_is_half
+      } else {
+        !f3_is_rvc(i)
+      })
+...  
+  val f3_predicted_target = Mux(f3_redirects.reduce(_||_),
+    Mux(f3_fetch_bundle.cfi_is_ret && useBPD.B && useRAS.B,
+      ras.io.read_addr,
+      f3_targs(PriorityEncoder(f3_redirects))
+    ),
+    nextFetch(f3_fetch_bundle.pc)
+  )
+```
+
+#### 总结
+
+F3阶段算是前端的一个核心阶段,这个阶段进行分支预解码,TAGE出结果,并且对RVC指令检测,将RVC变为32位指令,之后将f3_fetch_bundle送入F4
+
+### F4
+
+F4阶段主要进行的工作就是重定向操作,这个在F0中已经讲解,f4阶段还会将指令写入Fetchbuffer和FTQ
+
+f4阶段还会修复前端的BTB或RAS,首先有一个仲裁器选择重定向信息来自FTQ还是f4阶段的BTB重定向信息,(低位优先级高),如果FTQ传来RAS修复信号,就对RAS进行修复
+
+```
+  val bpd_update_arbiter = Module(new Arbiter(new BranchPredictionUpdate, 2))
+  bpd_update_arbiter.io.in(0).valid := ftq.io.bpdupdate.valid
+  bpd_update_arbiter.io.in(0).bits  := ftq.io.bpdupdate.bits
+  assert(bpd_update_arbiter.io.in(0).ready)
+  bpd_update_arbiter.io.in(1) <> f4_btb_corrections.io.deq
+  bpd.io.update := bpd_update_arbiter.io.out
+  bpd_update_arbiter.io.out.ready := true.B
+
+  when (ftq.io.ras_update && enableRasTopRepair.B) {
+    ras.io.write_valid := true.B
+    ras.io.write_idx   := ftq.io.ras_update_idx
+    ras.io.write_addr  := ftq.io.ras_update_pc
+  }
+```
+
+### F5
+
+虚拟的阶段,主要对将IFU数据送入IDU,进行重定向操作
+
 ## BOOM FTQ
 
 获取目标队列是一个队列，用于保存从 i-cache 接收到的 PC 以及与该地址关联的分支预测信息。它保存此信息，供管道在执行其[微操作 (UOP)](https://docs.boom-core.org/en/latest/sections/terminology.html#term-micro-op-uop)时参考。一旦提交指令，ROB 就会将其从队列中移出，并在重定向/误推测期间进行更新。
 
-## 入队
+### 入队
 
 当do_enq拉高，表示入队信号拉高，进入入队逻辑，new_entry和new_ghist接受入队数据，如现阶段有分支预测失败，就将入队glist写入new_list，否则，按照之前的数据更新new_list,然后写入ghist和lhist
 
 ```
-  // This register lets us initialize the ghist to 0
+
+// This register lets us initialize the ghist to 0
   val prev_ghist = RegInit((0.U).asTypeOf(new GlobalHistory))
   val prev_entry = RegInit((0.U).asTypeOf(new FTQBundle))
   val prev_pc    = RegInit(0.U(vaddrBitsExtended.W))
@@ -1426,6 +1507,10 @@ ExpandRVC判断这个指令是否为RVC,如果为RVC,返回相应的扩展指令
   io.enq_idx := enq_ptr
 ```
 
+global
+
+> globalhistory的current_saw_branch_not_taken是干什么的
+>
 > cfi这些信号是干什么的?
 >
 > nbank参数是干什莫的:划分icache的bank数目,这个与interleaving有关
@@ -1435,6 +1520,157 @@ ExpandRVC判断这个指令是否为RVC,如果为RVC,返回相应的扩展指令
 > pc如何保存?
 >
 > mask位为1代表这个指令有效,br_mask位为1代表这个有效指令是br指令(条件跳转),
+
+## Fetch Buffer
+
+Fetch Buffer本质上是一个FIFO，寄存器堆构成,主要是作为缓冲,其可以配置为流式fifo，Fetch Buffer每次从F4阶段输入一个Fetch Packets，根据掩码将无效指令去掉后，从Buffer的尾部进入，每次从Buffer的头部输出coreWidth（后续流水线并行执行的宽度）个指令到译码级。
+
+### 入队出队信号
+
+might_hit_head得出这次访问可能会满,at_head表示tail已经和head重叠了,只有前面信号都不满足,才可以写入
+
+> 假如fb大小为8项,每次最多写入4条,最多读出四条,假设连续写入两次,这时候tail和head就重合了,表示写满了
+
+will_hit_tail信号揭示了head是否会和tail重合,也就是指令是否还够取(每次必须corewidth条)
+
+> 参数和上一个例子一样,假如没有读出head为01,然后tail指针为0000 1000,表示写入了三条指令,这样得出来的tail_collisions就为0000 1000,然后will_hit_tail就为高,表示内部没有四条指令(妙)
+
+```
+  def rotateLeft(in: UInt, k: Int) = {
+    val n = in.getWidth
+    Cat(in(n-k-1,0), in(n-1, n-k))
+  }
+
+  val might_hit_head = (1 until fetchWidth).map(k => VecInit(rotateLeft(tail, k).asBools.zipWithIndex.filter
+    {case (e,i) => i % coreWidth == 0}.map {case (e,i) => e}).asUInt).map(tail => head & tail).reduce(_|_).orR
+  val at_head = (VecInit(tail.asBools.zipWithIndex.filter {case (e,i) => i % coreWidth == 0}
+    .map {case (e,i) => e}).asUInt & head).orR
+  val do_enq = !(at_head && maybe_full || might_hit_head)
+
+  io.enq.ready := do_enq
+...  
+val tail_collisions = VecInit((0 until numEntries).map(i =>
+                          head(i/coreWidth) && (!maybe_full || (i % coreWidth != 0).B))).asUInt & tail
+  val slot_will_hit_tail = (0 until numRows).map(i => tail_collisions((i+1)*coreWidth-1, i*coreWidth)).reduce(_|_)
+  val will_hit_tail = slot_will_hit_tail.orR
+
+  val do_deq = io.deq.ready && !will_hit_tail
+```
+
+### 转换输入
+
+代码如下,注意当w=0,需要考虑edge_inst,
+
+```
+  for (b <- 0 until nBanks) {
+    for (w <- 0 until bankWidth) {
+      val i = (b * bankWidth) + w
+      val pc = (bankAlign(io.enq.bits.pc) + (i << 1).U)
+      in_mask(i)                := io.enq.valid && io.enq.bits.mask(i)
+...
+
+      if (w == 0) {
+        when (io.enq.bits.edge_inst(b)) {
+          in_uops(i).debug_pc  := bankAlign(io.enq.bits.pc) + (b * bankBytes).U - 2.U
+          in_uops(i).pc_lob    := bankAlign(io.enq.bits.pc) + (b * bankBytes).U
+          in_uops(i).edge_inst := true.B
+        }
+      }
+      in_uops(i).ftq_idx        := io.enq.bits.ftq_idx
+      in_uops(i).inst           := io.enq.bits.exp_insts(i)
+      in_uops(i).debug_inst     := io.enq.bits.insts(i)
+      in_uops(i).is_rvc         := io.enq.bits.insts(i)(1,0) =/= 3.U
+      in_uops(i).taken          := io.enq.bits.cfi_idx.bits === i.U && io.enq.bits.cfi_idx.valid
+
+      in_uops(i).xcpt_pf_if     := io.enq.bits.xcpt_pf_if
+      in_uops(i).xcpt_ae_if     := io.enq.bits.xcpt_ae_if
+      in_uops(i).bp_debug_if    := io.enq.bits.bp_debug_if_oh(i)
+      in_uops(i).bp_xcpt_if     := io.enq.bits.bp_xcpt_if_oh(i)
+
+      in_uops(i).debug_fsrc     := io.enq.bits.fsrc
+    }
+  }
+```
+
+### 生成oh写索引
+
+向量大小为fetchwidth=8,如果输入指令是有效的,就写入inc的索引,否则写入之前的值
+
+> tail初始值为1,之后如果inc就将最高位移入最低位,哪一位为1就说明写入哪一位
+
+```
+  val enq_idxs = Wire(Vec(fetchWidth, UInt(numEntries.W)))
+
+  def inc(ptr: UInt) = {
+    val n = ptr.getWidth
+    Cat(ptr(n-2,0), ptr(n-1))
+  }
+
+  var enq_idx = tail
+  for (i <- 0 until fetchWidth) {
+    enq_idxs(i) := enq_idx
+    enq_idx = Mux(in_mask(i), inc(enq_idx), enq_idx)
+  }
+```
+
+#### 写入fb
+
+只将有效的写入fb,也就是,如果入队信号拉高,并且输入指令有效,且找到对应的写索引,就将数据写入fb
+
+```
+  for (i <- 0 until fetchWidth) {
+    for (j <- 0 until numEntries) {
+      when (do_enq && in_mask(i) && enq_idxs(i)(j)) {
+        ram(j) := in_uops(i)
+      }
+    }
+  }
+```
+
+#### 出队信号
+
+deq_vec就是把fb数据转换换为出队的,这里i/coreWidth得出的是出去的是第几行,i%coreWidth表示的是行内的哪条uops,然后使用Mux1H选出head的前corewidth条数据
+
+```
+  // Generate vec for dequeue read port.
+  for (i <- 0 until numEntries) {
+    deq_vec(i/coreWidth)(i%coreWidth) := ram(i)
+  }
+
+  io.deq.bits.uops zip deq_valids           map {case (d,v) => d.valid := v}
+  io.deq.bits.uops zip Mux1H(head, deq_vec) map {case (d,q) => d.bits  := q}
+  io.deq.valid := deq_valids.reduce(_||_)
+```
+
+#### 指针状态更新
+
+如果入队信号来了,就修改tail指针为enq_idx,出队就inc head指针,如果clear,就重置指针
+
+```
+  when (do_enq) {
+    tail := enq_idx
+    when (in_mask.reduce(_||_)) {
+      maybe_full := true.B
+    }
+  }
+
+  when (do_deq) {
+    head := inc(head)
+    maybe_full := false.B
+  }
+
+  when (io.clear) {
+    head := 1.U
+    tail := 1.U
+    maybe_full := false.B
+  }
+```
+
+#### 总结
+
+这里使用oh编码来对地址编码,然后fb还通过一些特殊的方法来判断head和tail关系,十分巧妙
+
+# 分支预测全流程
 
 # BOOM Decode
 
