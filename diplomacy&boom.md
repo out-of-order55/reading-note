@@ -1446,80 +1446,118 @@ f4阶段还会修复前端的BTB或RAS,首先有一个仲裁器选择重定向�
 
 ## BOOM FTQ
 
+
 获取目标队列是一个队列，用于保存从 i-cache 接收到的 PC 以及与该地址关联的分支预测信息。它保存此信息，供管道在执行其[微操作 (UOP)](https://docs.boom-core.org/en/latest/sections/terminology.html#term-micro-op-uop)时参考。一旦提交指令，ROB 就会将其从队列中移出，并在重定向/误推测期间进行更新。
 
 ### 入队
 
 当do_enq拉高，表示入队信号拉高，进入入队逻辑，new_entry和new_ghist接受入队数据，如现阶段有分支预测失败，就将入队glist写入new_list，否则，按照之前的数据更新new_list,然后写入ghist和lhist
 
+### 重定向
+
+> 为什么bpd_idx要增加
+>
+> 为什么要用两个ghist,
+
+如下面波形,bpd_repair就是ftq_idx对应的pc
+
+![1732436351046](image/diplomacy&boom/1732436351046.png)
+
 ```
+//下面是一次预测失败要经过的状态
+//| br_info   |  b2     |reg(b2)        |             |             |  
+//|   b1      |  red_val|mispred(false) |mispred(true)|mispred(false)|mispred(false)|          |____
+//|           |         |repair(false)  |repair(false)|repair(true) |repair(true)  |          |    |一直运行直到修复完成
+//                |                        repair_idx   repair_idx     repair_pc   |repair_idx| +__| 
+//                |                        end_idx                     repair_idx  |          |
+// (找到分支预测失败的ftq表项)                                          ()  
+//
 
-// This register lets us initialize the ghist to 0
-  val prev_ghist = RegInit((0.U).asTypeOf(new GlobalHistory))
-  val prev_entry = RegInit((0.U).asTypeOf(new FTQBundle))
-  val prev_pc    = RegInit(0.U(vaddrBitsExtended.W))
-  when (do_enq) {
+  when (io.redirect.valid) {
+    bpd_update_mispredict := false.B
+    bpd_update_repair     := false.B
+  } .elsewhen (RegNext(io.brupdate.b2.mispredict)) {
+    bpd_update_mispredict := true.B
+    bpd_repair_idx        := RegNext(io.brupdate.b2.uop.ftq_idx)
+    bpd_end_idx           := RegNext(enq_ptr)
+  } .elsewhen (bpd_update_mispredict) {//
+    bpd_update_mispredict := false.B
+    bpd_update_repair     := true.B
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+  } .elsewhen (bpd_update_repair && RegNext(bpd_update_mispredict)) {
+    bpd_repair_pc         := bpd_pc
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+  } .elsewhen (bpd_update_repair) {
+    bpd_repair_idx        := WrapInc(bpd_repair_idx, num_entries)
+    when (WrapInc(bpd_repair_idx, num_entries) === bpd_end_idx ||
+      bpd_pc === bpd_repair_pc)  {
+      bpd_update_repair := false.B
+    }
 
-    pcs(enq_ptr)           := io.enq.bits.pc
-
-    val new_entry = Wire(new FTQBundle)
-
-    new_entry.cfi_idx   := io.enq.bits.cfi_idx
-    // Initially, if we see a CFI, it is assumed to be taken.
-    // Branch resolutions may change this
-    new_entry.cfi_taken     := io.enq.bits.cfi_idx.valid
-    new_entry.cfi_mispredicted := false.B
-    new_entry.cfi_type      := io.enq.bits.cfi_type
-    new_entry.cfi_is_call   := io.enq.bits.cfi_is_call
-    new_entry.cfi_is_ret    := io.enq.bits.cfi_is_ret
-    new_entry.cfi_npc_plus4 := io.enq.bits.cfi_npc_plus4
-    new_entry.ras_top       := io.enq.bits.ras_top
-    new_entry.ras_idx       := io.enq.bits.ghist.ras_idx
-    new_entry.br_mask       := io.enq.bits.br_mask & io.enq.bits.mask
-    new_entry.start_bank    := bank(io.enq.bits.pc)
-
-    val new_ghist = Mux(io.enq.bits.ghist.current_saw_branch_not_taken,
-      io.enq.bits.ghist,
-      prev_ghist.update(
-        prev_entry.br_mask,
-        prev_entry.cfi_taken,
-        prev_entry.br_mask(prev_entry.cfi_idx.bits),
-        prev_entry.cfi_idx.bits,
-        prev_entry.cfi_idx.valid,
-        prev_pc,
-        prev_entry.cfi_is_call,
-        prev_entry.cfi_is_ret
-      )
-    )
-
-    lhist.map( l => l.write(enq_ptr, io.enq.bits.lhist))
-    ghist.map( g => g.write(enq_ptr, new_ghist))
-    meta.write(enq_ptr, io.enq.bits.bpd_meta)
-    ram(enq_ptr) := new_entry
-
-    prev_pc    := io.enq.bits.pc
-    prev_entry := new_entry
-    prev_ghist := new_ghist
-
-    enq_ptr := WrapInc(enq_ptr, num_entries)
   }
-
-  io.enq_idx := enq_ptr
 ```
 
-global
+分支预测失败的状态机如上面所示,
 
+接下来就是传入更新信息,首先将enq_ptr设置为传入的ftq_idx+1,如果这个重定向来自分支预测失败,就将更新信息写入redirect_new_entry,然后下个周期将更新信息写入prev_entry,将重定向的信息写入entry_ram;
+
+```
+  when (io.redirect.valid) {//传入更新信息
+    enq_ptr    := WrapInc(io.redirect.bits, num_entries)
+
+    when (io.brupdate.b2.mispredict) {
+    val new_cfi_idx = (io.brupdate.b2.uop.pc_lob ^
+      Mux(redirect_entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(log2Ceil(fetchWidth), 1)
+.......
+    }
+
+.......
+
+  } .elsewhen (RegNext(io.redirect.valid)) {//信息传入完成
+    prev_entry := RegNext(redirect_new_entry)
+    prev_ghist := bpd_ghist
+    prev_pc    := bpd_pc
+
+    ram(RegNext(io.redirect.bits)) := RegNext(redirect_new_entry)
+  }
+```
+
+### 后端读pc
+
+有两个端口,其中0端口是送入后端jmp_unit的,端口1主要是进行重定向获取pc的,主要代码如下
+
+```
+  for (i <- 0 until 2) {
+    val idx = io.get_ftq_pc(i).ftq_idx
+    val next_idx = WrapInc(idx, num_entries)
+    val next_is_enq = (next_idx === enq_ptr) && io.enq.fire
+    val next_pc = Mux(next_is_enq, io.enq.bits.pc, pcs(next_idx))
+    val get_entry = ram(idx)
+    val next_entry = ram(next_idx)
+    io.get_ftq_pc(i).entry     := RegNext(get_entry)
+    if (i == 1)
+      io.get_ftq_pc(i).ghist   := ghist(1).read(idx, true.B)
+    else
+      io.get_ftq_pc(i).ghist   := DontCare
+    io.get_ftq_pc(i).pc        := RegNext(pcs(idx))
+    io.get_ftq_pc(i).next_pc   := RegNext(next_pc)
+    io.get_ftq_pc(i).next_val  := RegNext(next_idx =/= enq_ptr || next_is_enq)
+    io.get_ftq_pc(i).com_pc    := RegNext(pcs(Mux(io.deq.valid, io.deq.bits, deq_ptr)))
+  }
+```
+
+>
+>
+>
+> 这些bpd_pc和mispred以及repair到底是干什么的
+>
+> 一条分支指令处理的流程
+>
 > globalhistory的current_saw_branch_not_taken是干什么的
 >
 > cfi这些信号是干什么的?
->
-> nbank参数是干什莫的:划分icache的bank数目,这个与interleaving有关
->
-> bank(),求出这个地址属于哪个bank
->
-> pc如何保存?
->
-> mask位为1代表这个指令有效,br_mask位为1代表这个有效指令是br指令(条件跳转),
+
+
 
 ## Fetch Buffer
 
@@ -1670,7 +1708,270 @@ deq_vec就是把fb数据转换换为出队的,这里i/coreWidth得出的是出�
 
 这里使用oh编码来对地址编码,然后fb还通过一些特殊的方法来判断head和tail关系,十分巧妙
 
+## 分支预测器
+
+### BranchPredictor
+
+分支预测器的选择都是在下面代码中,这里是分bank的,然后返回的为ComposedBranchPredictorBank
+
+> 为什么分bank?
+>
+> respose_in是干什么的
+
+```
+  val bpdStr = new StringBuilder
+  bpdStr.append(BoomCoreStringPrefix("==Branch Predictor Memory Sizes==\n"))
+  val banked_predictors = (0 until nBanks) map ( b => {
+    val m = Module(if (useBPD) new ComposedBranchPredictorBank else new NullBranchPredictorBank)
+    for ((n, d, w) <- m.mems) {
+      bpdStr.append(BoomCoreStringPrefix(f"bank$b $n: $d x $w = ${d * w / 8}"))
+      total_memsize = total_memsize + d * w / 8
+    }
+    m
+  })
+  bpdStr.append(BoomCoreStringPrefix(f"Total bpd size: ${total_memsize / 1024} KB\n"))
+  override def toString: String = bpdStr.toString
+```
+
+然后这个bank内主要就是分发逻辑,将更新信号分发到每个预测器,以及将预测信息送出,下面代码中getBPDComponents就是获得预测器信息,然后返回预测结果
+
+```
+  val (components, resp) = getBPDComponents(io.resp_in(0), p)
+  io.resp := resp
+```
+
+最终的分支预测信息来自下面代码,这是典型的TAGE_L结构,分支预测器的主要器件都包含在内
+
+![1732447150001](image/diplomacy&boom/1732447150001.png)
+
+#### 预测请求传入
+
+预测请求分bank讨论,但这里只讨论bank为2的情况,只考虑全局历史
+
+1. 传入请求的bank为0,这时bank0预测这个vpc,bank1预测下个bank的vpc
+2. 如果传入请求的bank为1,就让bank0预测下一个bank,bank预测这个bank
+
+具体代码如下
+
+```
+....
+    when (bank(io.f0_req.bits.pc) === 0.U) {
+.......
+
+      banked_predictors(0).io.f0_valid := io.f0_req.valid
+      banked_predictors(0).io.f0_pc    := bankAlign(io.f0_req.bits.pc)
+      banked_predictors(0).io.f0_mask  := fetchMask(io.f0_req.bits.pc)
+
+      banked_predictors(1).io.f0_valid := io.f0_req.valid
+      banked_predictors(1).io.f0_pc    := nextBank(io.f0_req.bits.pc)
+      banked_predictors(1).io.f0_mask  := ~(0.U(bankWidth.W))
+    } .otherwise {
+....
+      banked_predictors(0).io.f0_valid := io.f0_req.valid && !mayNotBeDualBanked(io.f0_req.bits.pc)
+      banked_predictors(0).io.f0_pc    := nextBank(io.f0_req.bits.pc)
+      banked_predictors(0).io.f0_mask  := ~(0.U(bankWidth.W))
+      banked_predictors(1).io.f0_valid := io.f0_req.valid
+      banked_predictors(1).io.f0_pc    := bankAlign(io.f0_req.bits.pc)
+      banked_predictors(1).io.f0_mask  := fetchMask(io.f0_req.bits.pc)
+    }
+    when (RegNext(bank(io.f0_req.bits.pc) === 0.U)) {
+      banked_predictors(0).io.f1_ghist  := RegNext(io.f0_req.bits.ghist.histories(0))
+      banked_predictors(1).io.f1_ghist  := RegNext(io.f0_req.bits.ghist.histories(1))
+    } .otherwise {
+      banked_predictors(0).io.f1_ghist  := RegNext(io.f0_req.bits.ghist.histories(1))
+      banked_predictors(1).io.f1_ghist  := RegNext(io.f0_req.bits.ghist.histories(0))
+    }
+```
+
+#### 预测结果传出
+
+首先获得bank0和bank1的有效信号b0_fire,b1_fire,然后预测器送出f3阶段的预测信号,代码如下
+
+```
+    val b0_fire = io.f3_fire && RegNext(RegNext(RegNext(banked_predictors(0).io.f0_valid)))
+    val b1_fire = io.f3_fire && RegNext(RegNext(RegNext(banked_predictors(1).io.f0_valid)))
+    banked_predictors(0).io.f3_fire := b0_fire
+    banked_predictors(1).io.f3_fire := b1_fire
+
+    banked_lhist_providers(0).io.f3_fire := b0_fire
+    banked_lhist_providers(1).io.f3_fire := b1_fire
+    // The branch prediction metadata is stored un-shuffled
+    io.resp.f3.meta(0)    := banked_predictors(0).io.f3_meta
+    io.resp.f3.meta(1)    := banked_predictors(1).io.f3_meta
+
+    io.resp.f3.lhist(0)   := banked_lhist_providers(0).io.f3_lhist
+    io.resp.f3.lhist(1)   := banked_lhist_providers(1).io.f3_lhist
+
+...
+
+    when (bank(io.resp.f3.pc) === 0.U) {
+      for (i <- 0 until bankWidth) {
+        io.resp.f3.preds(i)           := banked_predictors(0).io.resp.f3(i)
+        io.resp.f3.preds(i+bankWidth) := banked_predictors(1).io.resp.f3(i)
+      }
+    } .otherwise {
+      for (i <- 0 until bankWidth) {
+        io.resp.f3.preds(i)           := banked_predictors(1).io.resp.f3(i)
+        io.resp.f3.preds(i+bankWidth) := banked_predictors(0).io.resp.f3(i)
+      }
+    }
+
+```
+
+#### 更新逻辑
+
+将输入的更新信息送入每个bank,这里给出仿真图辅助理解,指令包的起始地址80000004位于bank0,所以bank0的valid一定为1,但cfi_valid却为0,因为输入的cfi_idx为6,说明分支在第六条,不在这个bank,所以bank0的cfi_valid为0
+
+![1732456469917](image/diplomacy&boom/1732456469917.png)
+
+接下来会基于largeboom(tage_l)来解析各个器件的主要逻辑,这些模块的IO都基于BranchPredictorBank,首先就是输入的分支预测请求,然后有预测信号resp,还有就是更新信号update,这三个信号是核心信号
+
+```
+  val io = IO(new Bundle {
+    val f0_valid = Input(Bool())
+    val f0_pc    = Input(UInt(vaddrBitsExtended.W))
+    val f0_mask  = Input(UInt(bankWidth.W))
+    // Local history not available until end of f1
+    val f1_ghist = Input(UInt(globalHistoryLength.W))
+    val f1_lhist = Input(UInt(localHistoryLength.W))
+
+    val resp_in = Input(Vec(nInputs, new BranchPredictionBankResponse))
+    val resp = Output(new BranchPredictionBankResponse)
+
+    // Store the meta as a UInt, use width inference to figure out the shape
+    val f3_meta = Output(UInt(bpdMaxMetaLength.W))
+
+    val f3_fire = Input(Bool())
+
+    val update = Input(Valid(new BranchPredictionBankUpdate))
+  })
+```
+
+### NLP分支预测
+
+NLP的分支预测结构由BIM表,RAS和BTB组成,如过查询BTB是ret,说明目标来自RAS,如果条目是无条件跳转,不查询BIM,
+
+#### UBTB
+
+![1732457973586](image/diplomacy&boom/1732457973586.png)
+
+每个BTB条目对应的tag都是整个fetch_packet的pc这样的预测粒度就是一整个packet,当前端或者BPD被重定向,BTB更新,如果分支没找到条目,就分配一个条目
+
+> BTB更新的tricky:
+
+#### BIM
+
+#### 方向预测逻辑
+
+BIM的默认set为2048,并且BIMset只能为2的幂次方,该预测器在f2阶段之后可以给出结果,s2阶段的resp就是预测方向信息,如果s2阶段有效,并且这个bank读出的bim表的项第1位为1,表示taken,否则为0
+
+> 注意,这里感觉浪费了空间,因为BIM的写入都是对每个w写入相同内容,而且读出也是相同,所以每个w读出的也是一样的
+
+```
+  val s2_req_rdata    = RegNext(data.read(s0_idx   , s0_valid))
+
+  val s2_resp         = Wire(Vec(bankWidth, Bool()))
+
+  for (w <- 0 until bankWidth) {
+
+    s2_resp(w)        := s2_valid && s2_req_rdata(w)(1) && !doing_reset
+    s2_meta.bims(w)   := s2_req_rdata(w)
+  }
+... 
+ for (w <- 0 until bankWidth) {
+    io.resp.f2(w).taken := s2_resp(w)
+    io.resp.f3(w).taken := RegNext(io.resp.f2(w).taken)
+  }
+```
+
+##### 更新逻辑
+
+更新是在f1阶段,如果一个bank里有br指令(taken)或者jal,就说明taken,旧的BIM值是传入的重定向值,或者就是之前的bypass值
+
+> 这里设置bypass主要就是为了减少SRAM访问次数,如果上次更新的数据idx和这次的一样,就直接把上次的值作为旧的值,否则就是之前读出的值(只有commit时才可以更新这个bypass值)
+
+s1_update_wdata更新计数器的值,然后在提交时写入data
+
+```
+  for (w <- 0 until bankWidth) {
+    s1_update_wmask(w)         := false.B
+    s1_update_wdata(w)         := DontCare
+
+    val update_pc = s1_update.bits.pc + (w << 1).U
+
+    when (s1_update.bits.br_mask(w) ||
+      (s1_update.bits.cfi_idx.valid && s1_update.bits.cfi_idx.bits === w.U)) {
+      val was_taken = (
+        s1_update.bits.cfi_idx.valid &&
+        (s1_update.bits.cfi_idx.bits === w.U) &&
+        (
+          (s1_update.bits.cfi_is_br && s1_update.bits.br_mask(w) && s1_update.bits.cfi_taken) ||
+          s1_update.bits.cfi_is_jal
+        )
+      )
+      val old_bim_value = Mux(wrbypass_hit, wrbypass(wrbypass_hit_idx)(w), s1_update_meta.bims(w))
+
+      s1_update_wmask(w)     := true.B
+
+      s1_update_wdata(w)     := bimWrite(old_bim_value, was_taken)
+    }
+
+
+  }
+
+  when (doing_reset || (s1_update.valid && s1_update.bits.is_commit_update)) {
+    data.write(
+      Mux(doing_reset, reset_idx, s1_update_index),
+      Mux(doing_reset, VecInit(Seq.fill(bankWidth) { 2.U }), s1_update_wdata),
+      Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmask.asUInt).asBools
+    )
+  }
+```
+
 # 分支预测全流程
+
+分支指令在boom中会经过预测阶段(ifu)->检测/重定向阶段(exu)->提交/更新阶段(commit阶段),boom采用的checkpoint来恢复CPU状态,每个分支都有自己的掩码,分支预测失败根据这个掩码定向冲刷指令,更新,刷新,重定向前端,
+
+## 预测阶段
+
+分支指令的预测阶段主要在F1,F2,F3阶段.这三个阶段会送出BPD的预测信息,并进行重定向操作,这个可以看之前IFU流水线讲解的F0阶段和F1阶段
+
+## 检测阶段
+
+这里主要对br指令进行了检测,br或者jalr,目标地址可能出错,所以会对方向检测,如果pc_sel为npc,就说明实际不taken,预测失败就说明前端预测taken,如果为PC_BRJMP就说明实际taken,就需要对预测的taken信号取反
+
+```
+ when (is_br || is_jalr) {
+    if (!isJmpUnit) {
+      assert (pc_sel =/= PC_JALR)
+    }
+    when (pc_sel === PC_PLUS4) {
+      mispredict := uop.taken
+    }
+    when (pc_sel === PC_BRJMP) {
+      mispredict := !uop.taken
+    }
+  }
+
+  val brinfo = Wire(new BrResolutionInfo)
+  // note: jal doesn't allocate a branch-mask, so don't clear a br-mask bit
+  brinfo.valid          := is_br || is_jalr
+  brinfo.mispredict     := mispredict
+  brinfo.uop            := uop
+  brinfo.cfi_type       := Mux(is_jalr, CFI_JALR,
+                           Mux(is_br  , CFI_BR, CFI_X))
+  brinfo.taken          := is_taken
+  brinfo.pc_sel         := pc_sel
+  brinfo.jalr_target    := DontCare
+```
+
+如果此时发生分支预测失败,就将分支预测失败路径指令全部删除,并且重定向前端,修改前端信息,重定向信息分为b1,b2,其中b1是在第一个周期br_mask,b2就是携带了重定向信息(第二个周期),
+
+```
+  val b1 = new BrUpdateMasks
+  // On the second cycle we get indices to reset pointers
+  val b2 = new BrResolutionInfo
+```
 
 # BOOM Decode
 
