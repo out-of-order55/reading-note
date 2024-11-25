@@ -1446,7 +1446,6 @@ f4阶段还会修复前端的BTB或RAS,首先有一个仲裁器选择重定向�
 
 ## BOOM FTQ
 
-
 获取目标队列是一个队列，用于保存从 i-cache 接收到的 PC 以及与该地址关联的分支预测信息。它保存此信息，供管道在执行其[微操作 (UOP)](https://docs.boom-core.org/en/latest/sections/terminology.html#term-micro-op-uop)时参考。一旦提交指令，ROB 就会将其从队列中移出，并在重定向/误推测期间进行更新。
 
 ### 入队
@@ -1546,9 +1545,6 @@ f4阶段还会修复前端的BTB或RAS,首先有一个仲裁器选择重定向�
   }
 ```
 
->
->
->
 > 这些bpd_pc和mispred以及repair到底是干什么的
 >
 > 一条分支指令处理的流程
@@ -1556,8 +1552,6 @@ f4阶段还会修复前端的BTB或RAS,首先有一个仲裁器选择重定向�
 > globalhistory的current_saw_branch_not_taken是干什么的
 >
 > cfi这些信号是干什么的?
-
-
 
 ## Fetch Buffer
 
@@ -1859,13 +1853,101 @@ NLP的分支预测结构由BIM表,RAS和BTB组成,如过查询BTB是ret,说明�
 
 > BTB更新的tricky:
 
+UBTB默认参数如下
+
+```
+case class BoomFAMicroBTBParams(
+  nWays: Int = 16,
+  offsetSz: Int = 13
+)
+```
+
+##### 预测逻辑
+
+首先检查是否hitBTB,如果hit,就预测地址,从btb取出偏移量,得出最终地址,同时得出是br还是jal,以及是否taken,br默认不taken
+
+```
+  for (w <- 0 until bankWidth) {
+    val entry_meta = meta(s1_hit_ways(w))(w)
+    s1_resp(w).valid := s1_valid && s1_hits(w)
+    s1_resp(w).bits  := (s1_pc.asSInt + (w << 1).S + btb(s1_hit_ways(w))(w).offset).asUInt
+    s1_is_br(w)      := s1_resp(w).valid &&  entry_meta.is_br
+    s1_is_jal(w)     := s1_resp(w).valid && !entry_meta.is_br
+    s1_taken(w)      := !entry_meta.is_br || entry_meta.ctr(1)
+
+    s1_meta.hits(w)     := s1_hits(w)
+  }
+...
+  for (w <- 0 until bankWidth) {
+    io.resp.f1(w).predicted_pc := s1_resp(w)
+    io.resp.f1(w).is_br        := s1_is_br(w)
+    io.resp.f1(w).is_jal       := s1_is_jal(w)
+    io.resp.f1(w).taken        := s1_taken(w)
+
+    io.resp.f2(w) := RegNext(io.resp.f1(w))
+    io.resp.f3(w) := RegNext(io.resp.f2(w))
+  }
+```
+
+如果未命中,就会采用下面的分配逻辑,
+
+> 这个分配逻辑暂时未搞明白是什么,可能涉及到了折叠,可以看分支历史的折叠
+
+```
+  val alloc_way = {
+    val r_metas = Cat(VecInit(meta.map(e => VecInit(e.map(_.tag)))).asUInt, s1_idx(tagSz-1,0))
+    val l = log2Ceil(nWays)
+    val nChunks = (r_metas.getWidth + l - 1) / l
+    val chunks = (0 until nChunks) map { i =>
+      r_metas(min((i+1)*l, r_metas.getWidth)-1, i*l)
+    }
+    chunks.reduce(_^_)
+  }
+  s1_meta.write_way := Mux(s1_hits.reduce(_||_),
+    PriorityEncoder(s1_hit_ohs.map(_.asUInt).reduce(_|_)),
+    alloc_way)
+```
+
+##### 更新逻辑
+
+BTB的更新主要分为更新offset和更新标签,更新offset,只要找到需要更新的way,然后将数据,传入这个way就可以,
+
+更新meta,主要看ctr计数器,如果一开始这一项在预测时没有命中(新分配的项),则先初始化ctr,否则即使根据was_taken更新这个ctr计数器
+
+```
+  // Write the BTB with the target
+  when (s1_update.valid && s1_update.bits.cfi_taken && s1_update.bits.cfi_idx.valid && s1_update.bits.is_commit_update) {
+    btb(s1_update_write_way)(s1_update_cfi_idx).offset := new_offset_value
+  }
+
+  // Write the meta
+  for (w <- 0 until bankWidth) {
+    when (s1_update.valid && s1_update.bits.is_commit_update &&
+      (s1_update.bits.br_mask(w) ||
+        (s1_update_cfi_idx === w.U && s1_update.bits.cfi_taken && s1_update.bits.cfi_idx.valid))) {
+      val was_taken = (s1_update_cfi_idx === w.U && s1_update.bits.cfi_idx.valid &&
+        (s1_update.bits.cfi_taken || s1_update.bits.cfi_is_jal))
+
+      meta(s1_update_write_way)(w).is_br := s1_update.bits.br_mask(w)
+      meta(s1_update_write_way)(w).tag   := s1_update_idx
+      meta(s1_update_write_way)(w).ctr   := Mux(!s1_update_meta.hits(w),
+        Mux(was_taken, 3.U, 0.U),
+        bimWrite(meta(s1_update_write_way)(w).ctr, was_taken)
+      )
+    }
+  }
+```
+
 #### BIM
 
-#### 方向预测逻辑
+BIM使用pc一部分索引,只在提交时更新(饱和计数器,即使少更新,只要训练到位,预测结果大差不差)
+
+##### 方向预测逻辑
 
 BIM的默认set为2048,并且BIMset只能为2的幂次方,该预测器在f2阶段之后可以给出结果,s2阶段的resp就是预测方向信息,如果s2阶段有效,并且这个bank读出的bim表的项第1位为1,表示taken,否则为0
 
 > 注意,这里感觉浪费了空间,因为BIM的写入都是对每个w写入相同内容,而且读出也是相同,所以每个w读出的也是一样的
+
 
 ```
   val s2_req_rdata    = RegNext(data.read(s0_idx   , s0_valid))
@@ -1890,7 +1972,11 @@ BIM的默认set为2048,并且BIMset只能为2的幂次方,该预测器在f2阶�
 
 > 这里设置bypass主要就是为了减少SRAM访问次数,如果上次更新的数据idx和这次的一样,就直接把上次的值作为旧的值,否则就是之前读出的值(只有commit时才可以更新这个bypass值)
 
-s1_update_wdata更新计数器的值,然后在提交时写入data
+s1_update_wdata更新计数器的值,然后在提交时写入data,
+
+> old_bim_value要得到的是正确的旧值,s1_update_meta可能是分支预测失败时传来的update值,bypass是提交的值,数据一定正确,而写入又是在提交阶段,所以old_value一定是正确的值,另一种做法就是在提交直接读出旧值,不过可能引入多余的延迟
+
+> 为什么s1阶段更新,s2阶段给出预测结果?一方面防止同时读写,另一方面,s1阶段更新,s2阶段就可以享受到更新的结果
 
 ```
   for (w <- 0 until bankWidth) {
@@ -1925,6 +2011,244 @@ s1_update_wdata更新计数器的值,然后在提交时写入data
       Mux(doing_reset, VecInit(Seq.fill(bankWidth) { 2.U }), s1_update_wdata),
       Mux(doing_reset, (~(0.U(bankWidth.W))), s1_update_wmask.asUInt).asBools
     )
+  }
+```
+
+#### RAS
+
+RAS的逻辑比较简单,主要分为读逻辑和写逻辑
+
+读RAS在f3阶段,判断指令是否为ret,写RAS在ftq传入更新RAS信息或者f3阶段的指令为call指令
+
+```
+class BoomRAS(implicit p: Parameters) extends BoomModule()(p)
+{
+  val io = IO(new Bundle {
+    val read_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+    val read_addr  = Output(UInt(vaddrBitsExtended.W))
+
+    val write_valid = Input(Bool())
+    val write_idx   = Input(UInt(log2Ceil(nRasEntries).W))
+    val write_addr  = Input(UInt(vaddrBitsExtended.W))
+  })
+  val ras = Reg(Vec(nRasEntries, UInt(vaddrBitsExtended.W)))
+
+  io.read_addr := Mux(RegNext(io.write_valid && io.write_idx === io.read_idx),
+    RegNext(io.write_addr),
+    RegNext(ras(io.read_idx)))
+
+  when (io.write_valid) {
+    ras(io.write_idx) := io.write_addr
+  }
+}
+
+```
+
+### BPD
+
+BPD仅仅对条件分支的方向进行预测,其他信息,比如那些指令是分支,目标是什么,无需在意,这些信息可以从BTB得知,所以BPD无需存储tag和分支目标地址,jal和jalr指令均由NLP预测,如果NLP预测失败,只能之后重定向
+
+![1732524502617](image/diplomacy&boom/1732524502617.png)
+
+BPD在f3给出结果,f4进行重定向,
+
+BPD采用全局历史,GHR进行推测更新,每个分支都有GHR快照,同时在BPD维护提交阶段的GHR
+
+> **请注意，在F0**阶段开始进行预测（读取全局历史记录时）和在F4阶段重定向[前端](https://docs.boom-core.org/en/latest/sections/terminology.html#term-front-end)（更新全局历史记录时）之间存在延迟。这会导致“影子”，其中在F0中开始进行预测的分支将看不到程序中一个（或两个）周期之前出现的分支（或其结果）（目前处于F1/2/3阶段）。但至关重要的是，这些“影子分支”必须反映在全局历史快照中。
+
+> 每个[FTQ](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)条目对应一个**提取**周期。对于每次预测，分支预测器都会打包稍后执行更新所需的数据。例如，分支预测器需要记住预测来自哪个 *索引，以便稍后更新该索引处的计数器。此数据存储在*[FTQ](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)中。[当Fetch Packet](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-packet)中的最后一条指令被提交时，[FTQ条目将被释放并返回到分支预测器。使用存储在](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)[FTQ](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)条目中的数据，分支预测器可以对其预测状态执行任何所需的更新。
+
+
+> FTQ保存着在提交期间更新分支预测器所需的分支预测器数据（无论是[正确](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)预测还是错误预测）。但是，当分支预测器做出错误预测时，需要额外的状态，必须立即更新。例如，如果发生错误预测，则必须将推测更新的GHR重置为正确值，然后处理器才能再次开始提取（和预测）。[](https://docs.boom-core.org/en/latest/sections/terminology.html#term-global-history-register-ghr)
+
+> **此状态可能非常昂贵，但一旦在执行**阶段解析了分支，就可以释放它。因此，状态与[分支重命名](https://docs.boom-core.org/en/latest/sections/terminology.html#term-branch-rename-snapshot)快照并行存储。在**解码** 和**重命名**期间，会为每个分支分配一个 **分支标记** ，并制作重命名表的快照，以便在发生错误预测时进行单周期回滚。与分支标记和**重命名映射表**快照一样， 一旦分支在 执行阶段由分支单元解析，就可以释放相应的[分支重命名快照](https://docs.boom-core.org/en/latest/sections/terminology.html#term-branch-rename-snapshot)。
+
+##### 抽象分支类
+
+![1732526267100](image/diplomacy&boom/1732526267100.png)
+
+#### TAGE
+
+TAGE的默认参数如下.可以看到BOOM例化了6个表,最大历史长度为64,并且ubit的更新周期为2048个周期,饱和计数器为3bits,user为2bit,
+
+```
+case class BoomTageParams(
+  //                                           nSets, histLen, tagSz
+  tableInfo: Seq[Tuple3[Int, Int, Int]] = Seq((  128,       2,     7),
+                                              (  128,       4,     7),
+                                              (  256,       8,     8),
+                                              (  256,      16,     8),
+                                              (  128,      32,     9),
+                                              (  128,      64,     9)),
+  uBitPeriod: Int = 2048
+)
+
+```
+
+##### TageTable
+
+**预测阶段**
+
+首先计算出hash_idx,根据该idx得出ctr和user_bit以及tag,然后将读出的信息传入tage进一步处理
+
+**写入逻辑**
+
+写入逻辑主要写入userbit,table
+
+**table:写入提交阶段传入的update_idx(这里的update同样有bypass)**
+
+```
+  table.write(
+    Mux(doing_reset, reset_idx                                          , update_idx),
+    Mux(doing_reset, VecInit(Seq.fill(bankWidth) { 0.U(tageEntrySz.W) }), VecInit(update_wdata.map(_.asUInt))),
+    Mux(doing_reset, ~(0.U(bankWidth.W))                                , io.update_mask.asUInt).asBools
+  )
+
+```
+
+user_bit分为两个段:hi和lo,主要讲hi:
+
+写入的idx来自reset_idx,clear_idx和update_idx,user_bit需要定期清0,clear前缀的就是清零有关信号,这里就是每2048个周期就去清零高位或者低位,
+
+> 由于是sram结构,一周期只能读1写1,所以也没啥问题,但为啥不同时清0hi和lo,猜想可能是先缓冲一下
+
+```
+  val doing_clear_u = clear_u_ctr(log2Ceil(uBitPeriod)-1,0) === 0.U
+  val doing_clear_u_hi = doing_clear_u && clear_u_ctr(log2Ceil(uBitPeriod) + log2Ceil(nRows)) === 1.U
+  val doing_clear_u_lo = doing_clear_u && clear_u_ctr(log2Ceil(uBitPeriod) + log2Ceil(nRows)) === 0.U
+  val clear_u_idx = clear_u_ctr >> log2Ceil(uBitPeriod)
+...  
+hi_us.write(
+    Mux(doing_reset, reset_idx, Mux(doing_clear_u_hi, clear_u_idx, update_idx)),
+    Mux(doing_reset || doing_clear_u_hi, VecInit((0.U(bankWidth.W)).asBools), update_hi_wdata),
+    Mux(doing_reset || doing_clear_u_hi, ~(0.U(bankWidth.W)), io.update_u_mask.asUInt).asBools
+  )
+```
+
+##### TAGE主要逻辑
+
+首先，定义所有产生tag匹配的预测表中所需历史长度最长者为provider，而其余产生tag匹配的预测表（若存在的话）被称为altpred。
+
+1. 当provider产生的预测被证实为一个正确的预测时，首先将产生的正确预测的对应provider表项的pred计数器自增1。其次，若此时的provider与altpred的预测结果不同，则provider的userfulness计数器自增1。
+2. 当provider产生的预测被证实为一个错误的预测时，首先将产生的错误预测的对应provider表项的pred预测器自减1。其次，若存在产生正确预测的altpred，则provider的usefulness计数器自减1。接下来，若该provider所源自的预测表并非所需历史长度最高的预测表，则此时执行如下的表项增添操作。首先，读取所有历史长度长于provider的预测表的usefulness计数器，若此时有某表的u计数器值为0，则在该表中分配一对应的表项。当有多个预测表（如Tj,Tk两项）的u计数器均为0，则将表项分配给Tk的几率为分配给Tj的2^(k-j)倍（这一概率分配在硬件上可以通过一个LFSR来实现）。若所有TAGE内预测表的u值均不为0，则所有预测表的u值同时减1。
+3. 只有provider和altpred的预测不同时才会更新
+
+###### 预测逻辑
+
+tage预测逻辑分为provider,和altpred,其中provider为历史最长的tag命中对应的table,altpred则是次高历史命中对应的table,如果table没有命中,则选择默认的结果,源论文为bim表得出的结果
+
+> 这里暂时不清楚默认预测器是什么,应该也是bim表
+
+这里首先遍历所有历史表,如果table hit,就将选择taken结果,如果ctr ===3.U|| ctr ===4.U,认为这个provider不可信,选择altpred的结果作为预测结果,否则选择ctr(2)为预测结果
+
+
+```
+    var altpred = io.resp_in(0).f3(w).taken
+    val final_altpred = WireInit(io.resp_in(0).f3(w).taken)
+    var provided = false.B
+    var provider = 0.U
+    io.resp.f3(w).taken := io.resp_in(0).f3(w).taken
+    //
+    for (i <- 0 until tageNTables) {
+      val hit = f3_resps(i)(w).valid
+      val ctr = f3_resps(i)(w).bits.ctr
+      when (hit) {
+        io.resp.f3(w).taken := Mux(ctr === 3.U || ctr === 4.U, altpred, ctr(2))//预测可能不准
+        final_altpred       := altpred
+      }
+
+      provided = provided || hit
+      provider = Mux(hit, i.U, provider)
+      altpred  = Mux(hit, f3_resps(i)(w).bits.ctr(2), altpred)
+    }
+    f3_meta.provider(w).valid := provided
+    f3_meta.provider(w).bits  := provider
+    f3_meta.alt_differs(w)    := final_altpred =/= io.resp.f3(w).taken//有预测未命中的项
+    f3_meta.provider_u(w)     := f3_resps(provider)(w).bits.u
+    f3_meta.provider_ctr(w)   := f3_resps(provider)(w).bits.ctr
+```
+
+###### 更新逻辑
+
+更新阶段就是去更新ctr和u计数器,如果预测失败可能还会去分配新的表项
+
+allocatable_slots就是找到未命中并且u为0的slot,如果这个多于一个,就通过LSFR大概率选择分支历史长的,这样就得到了要分配的table表项,如果是提交阶段更新,并且是条件分支指令,如果此时provider是有效的,就将信息写入对应的table,然后更新u_bit,以及ctr计数器,代码如下
+
+```
+    val allocatable_slots = (
+      VecInit(f3_resps.map(r => !r(w).valid && r(w).bits.u === 0.U)).asUInt &
+      ~(MaskLower(UIntToOH(provider)) & Fill(tageNTables, provided))
+    )
+    val alloc_lfsr = random.LFSR(tageNTables max 2)//如果u=0的个数大于1,使用LSFR选择,概率是历史长的大于历史短的
+
+    val first_entry = PriorityEncoder(allocatable_slots)
+    val masked_entry = PriorityEncoder(allocatable_slots & alloc_lfsr)
+    val alloc_entry = Mux(allocatable_slots(masked_entry),
+      masked_entry,
+      first_entry)
+
+    f3_meta.allocate(w).valid := allocatable_slots =/= 0.U
+    f3_meta.allocate(w).bits  := alloc_entry
+
+    val update_was_taken = (s1_update.bits.cfi_idx.valid &&
+                            (s1_update.bits.cfi_idx.bits === w.U) &&
+                            s1_update.bits.cfi_taken)
+    when (s1_update.bits.br_mask(w) && s1_update.valid && s1_update.bits.is_commit_update) {
+      when (s1_update_meta.provider(w).valid) {
+        val provider = s1_update_meta.provider(w).bits
+
+        s1_update_mask(provider)(w) := true.B
+        s1_update_u_mask(provider)(w) := true.B
+
+        val new_u = inc_u(s1_update_meta.provider_u(w),
+                          s1_update_meta.alt_differs(w),
+                          s1_update_mispredict_mask(w))
+        s1_update_u      (provider)(w) := new_u
+        s1_update_taken  (provider)(w) := update_was_taken
+        s1_update_old_ctr(provider)(w) := s1_update_meta.provider_ctr(w)
+        s1_update_alloc  (provider)(w) := false.B
+
+      }
+    }
+
+```
+
+###### 分配逻辑
+
+分配阶段其实是在更新阶段内的,但有自己独特的操作,故列出单讲
+
+首先分配表项是在提交阶段,发现provider预测失败,并且这个表项的表不是分支历史最长的表,进行表项分配,如果找到了可以分配的表项,就对表项分配,并且将对应的table表项u置为0,如果没有找到表项,就将符合条件的表项u置为0,但是不分配表项
+
+> 分配还会初始化ctr,原论文中新分配的表项为弱taken(4),这里只有这次更新taken才为4,否则为3
+
+> 这里好像boom和源论文做法不一样,原论文是将ubit递减,而不是直接置为0
+
+主要代码如下
+
+```
+  when (s1_update.valid && s1_update.bits.is_commit_update && s1_update.bits.cfi_mispredicted && s1_update.bits.cfi_idx.valid) {
+    val idx = s1_update.bits.cfi_idx.bits
+    val allocate = s1_update_meta.allocate(idx)
+    when (allocate.valid) {
+      s1_update_mask (allocate.bits)(idx) := true.B
+      s1_update_taken(allocate.bits)(idx) := s1_update.bits.cfi_taken
+      s1_update_alloc(allocate.bits)(idx) := true.B
+
+      s1_update_u_mask(allocate.bits)(idx) := true.B
+      s1_update_u     (allocate.bits)(idx) := 0.U
+
+    } .otherwise {
+      val provider = s1_update_meta.provider(idx)
+      val decr_mask = Mux(provider.valid, ~MaskLower(UIntToOH(provider.bits)), 0.U)
+
+      for (i <- 0 until tageNTables) {
+        when (decr_mask(i)) {
+          s1_update_u_mask(i)(idx) := true.B
+          s1_update_u     (i)(idx) := 0.U
+        }
+      }
+    }
+
   }
 ```
 
