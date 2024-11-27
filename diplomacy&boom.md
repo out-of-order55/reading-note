@@ -909,7 +909,7 @@ F2阶段和F1阶段的指令均无效。
 
 ### F1
 
-F1阶段进行tlb转换,并且得出ubtb结果,如果tlb miss需要终止icache访存
+F1阶段进行tlb转换,并且得出ubtb结果,如果tlb miss需要终止icache访存,这个周期ubtb给出预测结果,根据结果对前端重定向
 
 #### TLB访问逻辑
 
@@ -1089,6 +1089,12 @@ new_saw_branch_taken：bank1是否有taken的指令并且cfi不在bank0
 如果地址0011 0000,cfi_idx_oh为0001 0000
 
 这个地址mayNotBeDualBanked为0，cfi_in_bank0为0,如果cfi_idx_oh,cfi_in_bank0就为1
+
+> 这里ignore_second_bank的意思就是第二个分支没有分支或者分支无效,
+>
+> 假设第二个bank有分支,我们会忽视第一个bank的分支历史,只更新第二个bank
+
+> In the two bank case every bank ignore the history added by the previous bank
 
 ```
   def histories(bank: Int) = {
@@ -1704,6 +1710,37 @@ deq_vec就是把fb数据转换换为出队的,这里i/coreWidth得出的是出�
 
 ## 分支预测器
 
+composer模块将各个模块的请求和更新连接到IO,然后将各个模块的meta送出,
+
+> 所有模块共用meta,只不过是使用的位域不同,传入的meta同理,update信息之所以reverse,是因为低位的meta对应的是靠后的components
+
+```
+  var metas = 0.U(1.W)
+  var meta_sz = 0
+  for (c <- components) {
+    c.io.f0_valid  := io.f0_valid
+    c.io.f0_pc     := io.f0_pc
+    c.io.f0_mask   := io.f0_mask
+    c.io.f1_ghist  := io.f1_ghist
+    c.io.f1_lhist  := io.f1_lhist
+    c.io.f3_fire   := io.f3_fire
+    if (c.metaSz > 0) {
+      metas = (metas << c.metaSz) | c.io.f3_meta(c.metaSz-1,0)
+    }
+    meta_sz = meta_sz + c.metaSz
+  }
+  require(meta_sz < bpdMaxMetaLength)
+  io.f3_meta := metas
+
+
+  var update_meta = io.update.bits.meta
+  for (c <- components.reverse) {
+    c.io.update := io.update
+    c.io.update.bits.meta := update_meta
+    update_meta = update_meta >> c.metaSz
+  }
+```
+
 ### BranchPredictor
 
 分支预测器的选择都是在下面代码中,这里是分bank的,然后返回的为ComposedBranchPredictorBank
@@ -1948,7 +1985,6 @@ BIM的默认set为2048,并且BIMset只能为2的幂次方,该预测器在f2阶�
 
 > 注意,这里感觉浪费了空间,因为BIM的写入都是对每个w写入相同内容,而且读出也是相同,所以每个w读出的也是一样的
 
-
 ```
   val s2_req_rdata    = RegNext(data.read(s0_idx   , s0_valid))
 
@@ -1977,6 +2013,8 @@ s1_update_wdata更新计数器的值,然后在提交时写入data,
 > old_bim_value要得到的是正确的旧值,s1_update_meta可能是分支预测失败时传来的update值,bypass是提交的值,数据一定正确,而写入又是在提交阶段,所以old_value一定是正确的值,另一种做法就是在提交直接读出旧值,不过可能引入多余的延迟
 
 > 为什么s1阶段更新,s2阶段给出预测结果?一方面防止同时读写,另一方面,s1阶段更新,s2阶段就可以享受到更新的结果
+
+> 注意这里更新逻辑条件包括了jal/jalr指令,看之前的issue,说这个地方不对,但目前都没改
 
 ```
   for (w <- 0 until bankWidth) {
@@ -2057,7 +2095,6 @@ BPD采用全局历史,GHR进行推测更新,每个分支都有GHR快照,同时�
 > **请注意，在F0**阶段开始进行预测（读取全局历史记录时）和在F4阶段重定向[前端](https://docs.boom-core.org/en/latest/sections/terminology.html#term-front-end)（更新全局历史记录时）之间存在延迟。这会导致“影子”，其中在F0中开始进行预测的分支将看不到程序中一个（或两个）周期之前出现的分支（或其结果）（目前处于F1/2/3阶段）。但至关重要的是，这些“影子分支”必须反映在全局历史快照中。
 
 > 每个[FTQ](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)条目对应一个**提取**周期。对于每次预测，分支预测器都会打包稍后执行更新所需的数据。例如，分支预测器需要记住预测来自哪个 *索引，以便稍后更新该索引处的计数器。此数据存储在*[FTQ](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)中。[当Fetch Packet](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-packet)中的最后一条指令被提交时，[FTQ条目将被释放并返回到分支预测器。使用存储在](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)[FTQ](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)条目中的数据，分支预测器可以对其预测状态执行任何所需的更新。
-
 
 > FTQ保存着在提交期间更新分支预测器所需的分支预测器数据（无论是[正确](https://docs.boom-core.org/en/latest/sections/terminology.html#term-fetch-target-queue-ftq)预测还是错误预测）。但是，当分支预测器做出错误预测时，需要额外的状态，必须立即更新。例如，如果发生错误预测，则必须将推测更新的GHR重置为正确值，然后处理器才能再次开始提取（和预测）。[](https://docs.boom-core.org/en/latest/sections/terminology.html#term-global-history-register-ghr)
 
@@ -2140,7 +2177,6 @@ tage预测逻辑分为provider,和altpred,其中provider为历史最长的tag命
 > 这里暂时不清楚默认预测器是什么,应该也是bim表
 
 这里首先遍历所有历史表,如果table hit,就将选择taken结果,如果ctr ===3.U|| ctr ===4.U,认为这个provider不可信,选择altpred的结果作为预测结果,否则选择ctr(2)为预测结果
-
 
 ```
     var altpred = io.resp_in(0).f3(w).taken
@@ -2252,17 +2288,76 @@ allocatable_slots就是找到未命中并且u为0的slot,如果这个多于一�
   }
 ```
 
+### 总结
+
+目前前端逻辑还没搞明白ghist内部信号到底什么含义,还有wrbypass是为了干什么
+
+> 举个例子理解wrbypass,
+>
+> 假设下面指令:
+>
+> test:	addi a1,a1,1
+>
+> bne a1,a2,test
+>
+> 提交阶段可能是
+>
+> 假设bne为指令包1,addi,bne为指令包2,那么有
+>
+> bne		|addi,bne				|
+>
+> s0		|s1					|s2
+>
+> |指令包1写入新的bim值	|写入完成,同时也写入bypass内
+>
+> |					|指令包2写入新的bim值,此时旧的bim值来自bypass的,本身带的bim值太老
+>
+> 上面这种情况就解释了wrbypass的作用:及时的更新正确的bim值,防止出现performance bug
+
+> ghist是推测更新,也就是在分支预测每个阶段都会更新:
+>
+> 在f1阶段,这主要是UBTB,如果是br指令并且taken,就更新ghist
+>
+> f2阶段是bim的结果,bim实际上也不需要使用ghist,f2阶段预测的按理一定是br分支,但boom加入了jal,绝对会对ghr产生影响
+>
+> f3阶段是tage预测阶段,这个阶段ghist才有作用,
+>
+> 在f2和f3对之前的分支预测目标和方向进行检查,只要一个不满足,就重定向
+>
+> 之后就是后端传来的重定向信号,
+
 # 分支预测全流程
 
-分支指令在boom中会经过预测阶段(ifu)->检测/重定向阶段(exu)->提交/更新阶段(commit阶段),boom采用的checkpoint来恢复CPU状态,每个分支都有自己的掩码,分支预测失败根据这个掩码定向冲刷指令,更新,刷新,重定向前端,
+分支指令在boom中会经过预测/推测更新阶段(ifu)->检测/重定向阶段(exu)->更新阶段,boom采用的checkpoint来恢复CPU状态,每个分支都有自己的掩码,分支预测失败根据这个掩码定向冲刷指令,更新,刷新,重定向前端,
 
 ## 预测阶段
 
 分支指令的预测阶段主要在F1,F2,F3阶段.这三个阶段会送出BPD的预测信息,并进行重定向操作,这个可以看之前IFU流水线讲解的F0阶段和F1阶段
 
+> 目前的问题是,一个fetchpacket可能有多条分支指令,如何去正确记录分支历史,比如bne,bne 指令包.前一个不taken,后一个taken,这时候就要正确记录之前没有taken的指令历史,可能这个是按照bank更新分支历史,
+>
+> 分支预测是将一个指令包的指令全部送进去预测,分别得出结果
+
+预测阶段每个周期都会有新的ghist生成,比如在f3阶段有f3_predicted_ghist,这个就是更新后的历史,注意这个存的还是旧历史,但分支的taken信息已经包含在内了,假如f3 taken,对前面重定向,f1_predicted_ghist,读出的旧历史就是f3阶段更新后的历史(他会延迟更新,等到其他的去update,才会更新旧值)
+
+> 注意,此时存入ftq的ghist不是f3_predicted_ghist,而是f3_fetch_bundle.ghist,也就是相当于只存入的旧值,并未存入taken信息
+
+```
+  val f3_predicted_ghist = f3_fetch_bundle.ghist.update(
+    f3_fetch_bundle.br_mask,
+    f3_fetch_bundle.cfi_idx.valid,
+    f3_fetch_bundle.br_mask(f3_fetch_bundle.cfi_idx.bits),
+    f3_fetch_bundle.cfi_idx.bits,
+    f3_fetch_bundle.cfi_idx.valid,
+    f3_fetch_bundle.pc,
+    f3_fetch_bundle.cfi_is_call,
+    f3_fetch_bundle.cfi_is_ret
+  )
+```
+
 ## 检测阶段
 
-这里主要对br指令进行了检测,br或者jalr,目标地址可能出错,所以会对方向检测,如果pc_sel为npc,就说明实际不taken,预测失败就说明前端预测taken,如果为PC_BRJMP就说明实际taken,就需要对预测的taken信号取反
+(alu)这里主要对br指令进行了检测,br或者jalr,目标地址可能出错,所以会对方向检测,如果pc_sel为npc,就说明实际不taken,预测失败就说明前端预测taken,如果为PC_BRJMP就说明实际taken,就需要对预测的taken信号取反
 
 ```
  when (is_br || is_jalr) {
@@ -2295,6 +2390,66 @@ allocatable_slots就是找到未命中并且u为0的slot,如果这个多于一�
   val b1 = new BrUpdateMasks
   // On the second cycle we get indices to reset pointers
   val b2 = new BrResolutionInfo
+
+```
+
+在core.scala中,如果发现了mispredict,就要得出真正预测的目标,以及重定向信号
+
+```
+    val use_same_ghist = (brupdate.b2.cfi_type === CFI_BR &&//只有条件分支预测方向
+                          !brupdate.b2.taken &&//实际不用跳转
+                          bankAlign(block_pc) === bankAlign(npc))//最后一个条件意思是npc也在这个block内,如果是这样,那抹其实不需要更新ghist,
+    val ftq_entry = io.ifu.get_pc(1).entry
+    val cfi_idx = (brupdate.b2.uop.pc_lob ^
+      Mux(ftq_entry.start_bank === 1.U, 1.U << log2Ceil(bankBytes), 0.U))(log2Ceil(fetchWidth), 1)//得到这个分支的位置
+    val ftq_ghist = io.ifu.get_pc(1).ghist
+    val next_ghist = ftq_ghist.update(
+      ftq_entry.br_mask.asUInt,
+      brupdate.b2.taken,
+      brupdate.b2.cfi_type === CFI_BR,
+      cfi_idx,
+      true.B,
+      io.ifu.get_pc(1).pc,
+      ftq_entry.cfi_is_call && ftq_entry.cfi_idx.bits === cfi_idx,
+      ftq_entry.cfi_is_ret  && ftq_entry.cfi_idx.bits === cfi_idx)
+
+
+    io.ifu.redirect_ghist   := Mux(
+      use_same_ghist,
+      ftq_ghist,
+      next_ghist)
+    io.ifu.redirect_ghist.current_saw_branch_not_taken := use_same_ghist
+```
+
+## 重定向阶段
+
+如果分支预测失败,进入重定向逻辑,刷新前端,此时读出ftq对应表项的内容,包括ghist
+
+> 猜测分支预测的粒度是bank,这样use_same_ghist就可以解释清楚了,如果没有taken,并且npc和这个指令在同一个bank,则认为这个分支可以使用和ftq一样的历史,然后将current_saw_branch_not_taken置为高,之后如果update就会发现有分支未taken
+>
+> 这样current_saw_branch_not_taken也可以解释清楚了
+
+对于ghist选择有ftq_ghist和next_ghist,根据use_same_ghist选择对应的分支历史
+
+```
+    val use_same_ghist = (brupdate.b2.cfi_type === CFI_BR &&//只有条件分支预测方向
+                          !brupdate.b2.taken &&//实际不用跳转
+                          bankAlign(block_pc) === bankAlign(npc))//最后一个条件意思是npc也在这个block内,如果是这样,那么其实不需要更新ghist,如果是以bank为粒度预测,那么这个分支相当于没有预测,所以不计入历史
+...
+    val ftq_ghist = io.ifu.get_pc(1).ghist
+    val next_ghist = ftq_ghist.update(
+      ftq_entry.br_mask.asUInt,
+      brupdate.b2.taken,
+      brupdate.b2.cfi_type === CFI_BR,
+      cfi_idx,
+      true.B,
+      io.ifu.get_pc(1).pc,
+      ftq_entry.cfi_is_call && ftq_entry.cfi_idx.bits === cfi_idx,
+      ftq_entry.cfi_is_ret  && ftq_entry.cfi_idx.bits === cfi_idx)
+    io.ifu.redirect_ghist   := Mux(
+      use_same_ghist,
+      ftq_ghist,
+      next_ghist)
 ```
 
 # BOOM Decode
